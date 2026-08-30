@@ -844,6 +844,27 @@ export COMPATIBILITY_MODE=true
 
 ---
 
+## 🔧 403 错误排查指南（检验正常但使用报 403）
+
+本 fork 修复了上游"面板检验成功但实际调用 403"的问题（详见下方改动说明）。若仍遇到 403，按下表排查：
+
+| 403 message 关键词 | 真实原因 | 解法 |
+|---|---|---|
+| `User location is not supported` | 服务器出口 IP 在受限地区（cloudcode-pa 按出口 IP 判定，检验用的控制面 API 不判定） | 换部署地区，或设置 `PROXY` 让请求走干净出口 |
+| `API ... has not been used in project` / `disabled` | project_id 是普通项目，Code Assist API 未启用 | 手动编辑凭证 JSON，把 project_id 改成该账号下 `gen-lang-client-*` 项目 |
+| `Caller does not have required permission` | GCLI OAuth client 对该项目无 serviceusage/IAM 权限（普通项目） | 同上，换 `gen-lang-client-*` 项目 |
+| `Permission ... denied` | 账号风控 / 条款未接受 | 用 Gemini CLI 重新登录走完 onboarding |
+| `quota` / `exhausted` | 配额或积分耗尽 | 等待重置或更换凭证 |
+
+**本 fork 相对上游的改动：**
+
+1. **检验 = 真实调用**：面板"检验"现在会对 `cloudcode-pa` 发起一次 `maxOutputTokens:1` 的真实 generateContent（约消耗 1 token），403 时直接返回失败与中文诊断，不再出现"检验绿灯、使用红灯"。
+2. **选项目策略修复**：多项目时优先选择 `gen-lang-client-*`（GCLI client 原生有权限的项目），再按 "default" 关键字，最后才取第一个，避免随机选中无权限的普通项目。
+3. **enable 失败不再静默**：检验过程中启用 API 失败会以警告形式返回到检验结果里。
+4. **403 自动封禁时输出根因诊断日志**：`[GEMINICLI 403诊断]` 一行告诉你该换 IP、换项目还是换凭证。
+
+> ⚠️ 测试凭证请勿发送 "Hi"（会被本地健康检查拦截伪造响应），请发一句真实问题。
+
 ## 💬 交流群
 
 欢迎加入 QQ 群交流讨论！

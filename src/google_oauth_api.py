@@ -508,11 +508,28 @@ async def get_user_projects(credentials: Credentials) -> List[Dict[str, Any]]:
 
 
 async def select_default_project(projects: List[Dict[str, Any]]) -> Optional[str]:
-    """从项目列表中选择默认项目"""
+    """从项目列表中选择默认项目
+
+    选择策略（按优先级）：
+    1. gen-lang-client-* 项目：AI Studio/Gemini CLI OAuth client 原生关联的项目，
+       client 在其上具备完整的 serviceusage/调用权限。实测普通项目上启用
+       cloudaicompanion 等 API 会返回 403 (Caller does not have required permission)，
+       而这会导致"检验正常但实际调用 403"，因此必须优先选择 gen-lang 项目。
+    2. 显示名称或项目ID包含 "default" 的项目（原逻辑）
+    3. 第一个项目（原兜底逻辑）
+    """
     if not projects:
         return None
 
-    # 策略1：查找显示名称或项目ID包含"default"的项目
+    # 策略1：优先选择 gen-lang-client-* 项目（GCLI client 有权限的项目）
+    for project in projects:
+        # Google API returns projectId in camelCase
+        project_id = project.get("projectId", "")
+        if project_id.startswith("gen-lang-client-"):
+            log.info(f"优先选择 gen-lang 项目: {project_id} ({project.get('displayName', project_id)})")
+            return project_id
+
+    # 策略2：查找显示名称或项目ID包含"default"的项目
     for project in projects:
         display_name = project.get("displayName", "").lower()
         # Google API returns projectId in camelCase
@@ -521,12 +538,13 @@ async def select_default_project(projects: List[Dict[str, Any]]) -> Optional[str
             log.info(f"选择默认项目: {project_id} ({project.get('displayName', project_id)})")
             return project_id
 
-    # 策略2：选择第一个项目
+    # 策略3：选择第一个项目
     first_project = projects[0]
     # Google API returns projectId in camelCase
     project_id = first_project.get("projectId", "")
     log.info(
-        f"选择第一个项目作为默认: {project_id} ({first_project.get('displayName', project_id)})"
+        f"选择第一个项目作为默认: {project_id} ({first_project.get('displayName', project_id)}) "
+        f"(注意: 该项目不是 gen-lang-client-*，若无权限请手动指定 project_id)"
     )
     return project_id
 

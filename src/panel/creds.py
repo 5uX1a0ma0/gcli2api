@@ -558,6 +558,7 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
         await storage_adapter.store_credential(filename, credential_data, mode=mode)
 
     # 重新获取project id（仅 antigravity 模式请求积分）
+    enable_warning = ""
     if mode == "antigravity":
         api_base_url = await get_antigravity_api_url()
         user_agent = ANTIGRAVITY_USER_AGENT
@@ -583,8 +584,14 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
         if project_id:
             log.info(f"正在为项目 {project_id} 启用必需的API服务...")
             try:
-                await enable_required_apis(credentials, project_id)
+                enable_ok = await enable_required_apis(credentials, project_id)
+                if enable_ok is False:
+                    enable_warning = (
+                        f"（警告：在项目 {project_id} 上启用API未完全成功，"
+                        f"普通项目上GCLI client可能无权限，若无权限请将project_id改为gen-lang-client-*项目）"
+                    )
             except Exception as e:
+                enable_warning = f"（警告：启用API服务失败: {e}）"
                 log.warning(f"启用API服务失败: {e}")
 
     if project_id:
@@ -592,6 +599,77 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
 
     if project_id or subscription_tier:
         await storage_adapter.store_credential(filename, credential_data, mode=mode)
+
+        # ===== 真实调用验证（与实际使用完全相同的路径）=====
+        # 旧逻辑只验证"刷token + 列项目 + 尽力enableAPI"，从不真正调用模型，
+        # 因此检测不到：项目无调用权限、Code Assist API未启用、服务器出口IP
+        # 受限等情况，导致"检验正常但使用403"。
+        # 现改为检验时通过 v1internal:generateContent 发起一次 maxOutputTokens=1
+        # 的真实调用（与面板"测试"端点一致），非 200/429 直接判定检验失败并诊断。
+        real_check_ok = True
+        real_check_message = ""
+        try:
+            from src.httpx_client import post_async
+
+            if mode == "antigravity":
+                from src.api.antigravity import build_antigravity_headers
+                test_api_base = await get_antigravity_api_url()
+                test_headers = build_antigravity_headers(credentials.access_token)
+            else:
+                test_api_base = await get_code_assist_endpoint()
+                test_headers = {
+                    "Authorization": f"Bearer {credentials.access_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": GEMINICLI_USER_AGENT,
+                }
+
+            real_resp = await post_async(
+                url=f"{test_api_base}/v1internal:generateContent",
+                json={
+                    "model": "gemini-2.5-flash",
+                    "project": project_id or credential_data.get("project_id", ""),
+                    "request": {
+                        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                        "generationConfig": {"maxOutputTokens": 1}
+                    }
+                },
+                headers=test_headers,
+                timeout=30.0
+            )
+            # 200=真实调用成功；429=凭证有效仅被限流（与"测试"端点语义一致）
+            if real_resp.status_code not in (200, 429):
+                real_check_ok = False
+                try:
+                    real_body = real_resp.text if hasattr(real_resp, "text") else str(real_resp.content)
+                except Exception:
+                    real_body = ""
+                from src.utils import diagnose_gcp_403
+                hint = diagnose_gcp_403(real_body)
+                real_check_message = (
+                    f"检验失败：真实调用返回 {real_resp.status_code}。{hint}"
+                    f"（原始响应: {real_body[:300]}）"
+                )
+                log.error(
+                    f"检验 {mode} 凭证真实调用失败: {filename} "
+                    f"status={real_resp.status_code} 诊断: {hint}"
+                )
+        except Exception as e:
+            real_check_ok = False
+            real_check_message = f"检验失败：真实调用异常 {e}"
+            log.error(f"检验 {mode} 凭证真实调用异常: {filename} {e}")
+
+        # 真实调用未通过：不解除禁用状态，直接返回失败与诊断建议
+        if not real_check_ok:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "filename": filename,
+                    "project_id": project_id,
+                    "subscription_tier": subscription_tier,
+                    "message": real_check_message
+                }
+            )
 
         # 检验成功后自动解除禁用状态并清除错误码
         state_update = {
@@ -608,14 +686,17 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
 
         await storage_adapter.update_credential_state(filename, state_update, mode=mode)
 
-        log.info(f"检验 {mode} 凭证成功: {filename} - Project ID: {project_id}, Tier: {subscription_tier} - 已解除禁用并清除错误码")
+        log.info(f"检验 {mode} 凭证成功(含真实调用验证): {filename} - Project ID: {project_id}, Tier: {subscription_tier} - 已解除禁用并清除错误码")
 
         response_data = {
             "success": True,
             "filename": filename,
             "project_id": project_id,
             "subscription_tier": subscription_tier,
-            "message": "检验成功！Project ID已更新，已解除禁用状态并清除错误码，403错误应该已恢复"
+            "message": (
+                "检验成功！已通过真实API调用验证（消耗约1 token），"
+                "Project ID已更新，已解除禁用状态并清除错误码" + enable_warning
+            )
         }
 
         if mode == "antigravity" and credit_amount is not None:

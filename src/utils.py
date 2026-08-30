@@ -24,6 +24,48 @@ def get_geminicli_user_agent(model: str = "") -> str:
 # 静态常量
 GEMINICLI_USER_AGENT = get_geminicli_user_agent()
 
+
+def diagnose_gcp_403(error_body: str) -> str:
+    """根据 Google API 403 错误体内容给出中文诊断建议
+
+    用于区分"检验正常但使用 403"的几种常见根因：
+    - 地区封锁（cloudcode-pa 按服务器出口 IP 判定，检验用的控制面 API 不判定）
+    - project_id 选错（普通项目上无 Code Assist 权限/API 未启用）
+    - 计费/配额问题
+    """
+    body = (error_body or "").lower()
+    if "user location is not supported" in body or (
+        "location" in body and "not supported" in body
+    ):
+        return (
+            "出口IP在受限地区(HK/CN等)：cloudcode-pa按服务器出口IP判定地区，"
+            "请配置 PROXY 环境变量走干净出口，或更换部署地区"
+        )
+    if "has not been used in project" in body or "is disabled" in body or (
+        "api" in body and "not been used" in body
+    ):
+        return (
+            "项目未启用Code Assist相关API或project_id选错：请将凭证的project_id"
+            "手动改为 gen-lang-client-* 项目后重新检验"
+        )
+    if "required permission" in body or ("permission" in body and "denied" in body):
+        return (
+            "OAuth client对该项目无IAM权限：project_id应为 gen-lang-client-* 项目，"
+            "普通项目上GCLI client无serviceusage/调用权限"
+        )
+    if "billing" in body:
+        return "项目计费问题：请更换绑定了计费账户的项目"
+    if "quota" in body or "exceeded" in body or "exhausted" in body:
+        return "配额/积分耗尽：等待重置或更换凭证"
+    if "terms of service" in body or "has not accepted" in body:
+        return "服务条款未接受：请用 Gemini CLI 重新登录完成onboarding"
+    if not body.strip():
+        return (
+            "403常见原因：①出口IP在受限地区(配PROXY换出口)；②project_id选到无权限的"
+            "普通项目(改为gen-lang-client-*)；③Code Assist API未启用。详见README 403排查表"
+        )
+    return "未知403：请查看日志中的原始错误详情"
+
 # Antigravity CLI 客户端仿真常量
 ANTIGRAVITY_CLI_VERSION = "1.1.12"
 ANTIGRAVITY_CLI_PLATFORM = "windows/amd64"

@@ -73,7 +73,8 @@ async def handle_error_with_retry(
     attempt: int,
     max_retries: int,
     retry_interval: float,
-    mode: str = "geminicli"
+    mode: str = "geminicli",
+    error_body: str = ""
 ) -> bool:
     """
     统一处理错误和重试逻辑
@@ -93,7 +94,8 @@ async def handle_error_with_retry(
         max_retries: 最大重试次数
         retry_interval: 重试间隔
         mode: 模式（geminicli 或 antigravity）
-        
+        error_body: 错误响应体（可选，用于403根因诊断）
+
     Returns:
         bool: True表示需要继续重试，False表示不需要重试
     """
@@ -101,6 +103,17 @@ async def handle_error_with_retry(
     should_auto_ban = await check_should_auto_ban(status_code)
 
     if should_auto_ban:
+        # 403根因诊断：避免"使用403被自动禁用→面板检验又通过→再使用再403"的循环中无从排查
+        if status_code == 403:
+            try:
+                from src.utils import diagnose_gcp_403
+                log.warning(
+                    f"[{mode.upper()} 403诊断] credential={credential_name} "
+                    f"诊断: {diagnose_gcp_403(error_body)}"
+                )
+            except Exception:
+                pass
+
         # 触发自动封禁
         await handle_auto_ban(credential_manager, status_code, credential_name, mode)
 
