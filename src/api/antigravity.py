@@ -7,6 +7,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import time
 import traceback
 import uuid
@@ -24,7 +25,9 @@ from log import log
 
 from src.credential_manager import (
     add_credential,
+    get_available_model_ids,
     get_valid_credential,
+    invalidate_model_cache,
 )
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
@@ -198,6 +201,25 @@ def _is_retryable_status(status_code: int, disable_error_codes: List[int]) -> bo
     return status_code in (429, 503) or status_code in disable_error_codes
 
 
+def _is_model_not_found_error(status_code: int, error_text: str) -> bool:
+    """只识别明确的模型不可用 400，参数/工具/签名错误不能触发模型分流。"""
+    if status_code != 400:
+        return False
+    try:
+        error = json.loads(error_text).get("error", {})
+        message = error.get("message", "")
+        if not isinstance(message, str):
+            return False
+        return bool(re.search(
+            r"\b(?:requested\s+)?model"
+            r"(?:\s+(?:[`\"'][^`\"']+[`\"']|[\w./:-]+))?"
+            r"\s+(?:is\s+)?(?:not\s+found|does\s+not\s+exist|not\s+available|not\s+supported)\b",
+            message, re.IGNORECASE,
+        ))
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 async def _switch_credential_for_retry(
     *,
     next_cred_task: Optional[asyncio.Task],
@@ -325,10 +347,11 @@ async def stream_request(
 
     # 凭证亲和: 从请求内容派生会话 key
     session_key = _derive_session_key(model_name, body)
+    excluded_emails: set[str] = set()
 
     # 1. 获取有效凭证
     cred_result = await get_valid_credential(
-        model_name=model_name, session_key=session_key
+        model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
     )
 
     if not cred_result:
@@ -389,7 +412,7 @@ async def stream_request(
     async def refresh_credential_fast():
         nonlocal current_file, access_token, auth_headers, project_id, final_payload
         cred_result = await get_valid_credential(
-            model_name=model_name, session_key=session_key
+            model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
         )
         if not cred_result:
             return None
@@ -405,6 +428,8 @@ async def stream_request(
 
     def apply_cred_result(cred_result: Tuple[str, Dict[str, Any]]) -> bool:
         nonlocal current_file, access_token, project_id, auth_headers, final_payload
+        if cred_result[0] in excluded_emails:
+            return False
         current_file, credential_data = cred_result
         access_token = credential_data.get("access_token") or credential_data.get("token")
         project_id = credential_data.get("project_id", "")
@@ -414,9 +439,11 @@ async def stream_request(
         final_payload["project"] = project_id
         return True
 
-    for attempt in range(max_retries + 1):
+    attempt = 0
+    while attempt <= max_retries:
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
+        model_not_found = False
         usage_tokens: Dict[str, int] = {}  # 从流中提取的 token 用量
         attempt_start_time = time.time()  # 本次上游调用开始时间
 
@@ -469,6 +496,17 @@ async def stream_request(
                         error_body = ""
                     last_error_body = error_body or ""
 
+                    if _is_model_not_found_error(status_code, last_error_body):
+                        excluded_emails.add(current_file)
+                        invalidate_model_cache(current_file)
+                        await record_api_call_error(
+                            current_file, status_code, model_name=model_name,
+                            error_message=last_error_body,
+                        )
+                        await _log_stream_result(status_code, False, last_error_body)
+                        model_not_found = need_retry = True
+                        break
+
                     # 如果错误码是429、503或者在禁用码当中，做好记录后进行重试
                     if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
                         log.warning(f"[ANTIGRAVITY STREAM] 流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_body[:500] if error_body else '无'}")
@@ -485,7 +523,8 @@ async def stream_request(
                         if next_cred_task is None and attempt < max_retries:
                             next_cred_task = asyncio.create_task(
                                 get_valid_credential(
-                                    model_name=model_name, session_key=session_key
+                                    model_name=model_name, session_key=session_key,
+                                    excluded_emails=excluded_emails,
                                 )
                             )
 
@@ -568,6 +607,13 @@ async def stream_request(
             
             # 统一处理重试
             if need_retry:
+                # 能力变化的分流不占用 429 重试次数；每个失配凭证最多试一次。
+                if model_not_found:
+                    if await refresh_credential_fast():
+                        continue
+                    yield last_error_response
+                    return
+
                 log.info(f"[ANTIGRAVITY STREAM] 重试请求 (attempt {attempt + 2}/{max_retries + 1})...")
 
                 switched, next_cred_task = await _switch_credential_for_retry(
@@ -586,6 +632,7 @@ async def stream_request(
                         media_type="application/json"
                     )
                     return
+                attempt += 1
                 continue  # 重试
 
         except GeneratorExit:
@@ -604,6 +651,7 @@ async def stream_request(
                 # 本次上游调用（异常）产生一条日志
                 await _log_stream_result(500, False, f"异常: {e}")
                 await asyncio.sleep(retry_interval)
+                attempt += 1
                 continue
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）
@@ -620,7 +668,7 @@ async def stream_request(
                     )
                 return
 
-    # 所有重试均已耗尽（for循环正常结束）——每次上游调用均已各自记录日志，
+    # 所有重试均已耗尽——每次上游调用均已各自记录日志，
     # 这里不额外记录，直接返回最后一次的错误响应
     log.error("[ANTIGRAVITY STREAM] 所有重试均失败")
     if last_error_response:
@@ -697,8 +745,9 @@ async def non_stream_request(
     session_key = _derive_session_key(model_name, body)
 
     # 1. 获取有效凭证
+    excluded_emails: set[str] = set()
     cred_result = await get_valid_credential(
-        model_name=model_name, session_key=session_key
+        model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
     )
 
     if not cred_result:
@@ -748,7 +797,7 @@ async def non_stream_request(
     async def refresh_credential_fast():
         nonlocal current_file, access_token, auth_headers, project_id, final_payload
         cred_result = await get_valid_credential(
-            model_name=model_name, session_key=session_key
+            model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
         )
         if not cred_result:
             return None
@@ -765,6 +814,8 @@ async def non_stream_request(
     def apply_cred_result(cred_result: Tuple[str, Dict[str, Any]]) -> bool:
         nonlocal current_file, access_token, project_id, auth_headers, final_payload
         current_file, credential_data = cred_result
+        if current_file in excluded_emails:
+            return False
         access_token = credential_data.get("access_token") or credential_data.get("token")
         project_id = credential_data.get("project_id", "")
         if not access_token or not project_id:
@@ -773,7 +824,8 @@ async def non_stream_request(
         final_payload["project"] = project_id
         return True
 
-    for attempt in range(max_retries + 1):
+    attempt = 0
+    while attempt <= max_retries:
         need_retry = False  # 标记是否需要重试
         attempt_start_time = time.time()  # 本次上游调用开始时间
         
@@ -835,6 +887,18 @@ async def non_stream_request(
                     pass
                 last_error_body = error_text
 
+                if _is_model_not_found_error(status_code, error_text):
+                    excluded_emails.add(current_file)
+                    invalidate_model_cache(current_file)
+                    await record_api_call_error(
+                        current_file, status_code, model_name=model_name,
+                        error_message=error_text,
+                    )
+                    await _log_result(status_code, False, error_message=error_text)
+                    if await refresh_credential_fast():
+                        continue
+                    return last_error_response
+
                 if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
                     log.warning(f"[ANTIGRAVITY] 非流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500] if error_text else '无'}")
 
@@ -850,7 +914,8 @@ async def non_stream_request(
                     if next_cred_task is None and attempt < max_retries:
                         next_cred_task = asyncio.create_task(
                                 get_valid_credential(
-                                    model_name=model_name, session_key=session_key
+                                    model_name=model_name, session_key=session_key,
+                                    excluded_emails=excluded_emails,
                                 )
                             )
 
@@ -898,6 +963,7 @@ async def non_stream_request(
                         status_code=500,
                         media_type="application/json"
                     )
+                attempt += 1
                 continue  # 重试
 
         except Exception as e:
@@ -907,6 +973,7 @@ async def non_stream_request(
                 # 本次上游调用（异常）产生一条日志
                 await _log_result(500, False, error_message=f"异常: {e}")
                 await asyncio.sleep(retry_interval)
+                attempt += 1
                 continue
             else:
                 # 所有重试都失败，返回最后一次的错误（如果有）或500错误
@@ -921,7 +988,7 @@ async def non_stream_request(
                         media_type="application/json"
                     )
 
-    # 所有重试都失败（for循环正常结束）——每次上游调用均已各自记录日志，
+    # 所有重试都失败——每次上游调用均已各自记录日志，
     # 这里不额外记录，直接返回最后一次的原始错误
     log.error("[ANTIGRAVITY] 所有重试均失败")
     if last_error_response:
@@ -948,90 +1015,52 @@ def _is_listable_model(model_id: str) -> bool:
     return any(family in lowered for family in _MODEL_FAMILY_WHITELIST)
 
 
-async def fetch_available_models() -> List[Dict[str, Any]]:
-    """
-    获取可用模型列表，返回符合 OpenAI API 规范的格式
-    过滤规则：名字带 disabled 的不返回；名字不含 claude/gemini/gpt/argon 的不返回
-
-    Returns:
-        模型列表，格式为字典列表
-
-    Raises:
-        返回空列表如果获取失败
-    """
-    # 获取凭证管理器和可用凭证
-    cred_result = await get_valid_credential()
-    if not cred_result:
-        log.error("[ANTIGRAVITY] No valid credentials available for fetching models")
-        return []
-
-    current_file, credential_data = cred_result
-    access_token = credential_data.get("access_token") or credential_data.get("token")
-
+async def fetch_credential_model_ids(
+    access_token: str, project_id: str = "", api_url: Optional[str] = None
+) -> Optional[frozenset[str]]:
+    """查询指定凭证的真实模型能力；失败返回 None，成功的空列表仍为空集合。"""
     if not access_token:
-        log.error(f"[ANTIGRAVITY] No access token in credential: {current_file}")
-        return []
-
-    # 构建请求头
+        return None
     headers = build_antigravity_headers(access_token, model_name="agent")
-
     try:
-        # 使用 POST 请求获取模型列表
         response = await post_async(
-            url=f"{await get_antigravity_api_url()}/v1internal:fetchAvailableModels",
-            json={},  # 空的请求体
-            headers=headers
+            url=f"{api_url or await get_antigravity_api_url()}/v1internal:fetchAvailableModels",
+            json={"project": project_id} if project_id else {},
+            headers=headers,
+            timeout=15.0,
         )
-
-        if response.status_code == 200:
-            data = response.json()
-            log.debug(f"[ANTIGRAVITY] Raw models response: {json.dumps(data, ensure_ascii=False)[:500]}")
-
-            # 转换为 OpenAI 格式的模型列表，使用 Model 类
-            model_list = []
-            current_timestamp = int(datetime.now(timezone.utc).timestamp())
-
-            if 'models' in data and isinstance(data['models'], dict):
-                # 遍历模型字典（应用过滤规则）
-                for model_id in data['models'].keys():
-                    if not _is_listable_model(model_id):
-                        continue
-                    model = Model(
-                        id=model_id,
-                        object='model',
-                        created=current_timestamp,
-                        owned_by='google'
-                    )
-                    model_list.append(model_to_dict(model))
-            # 添加额外的 claude-sonnet-4-6-thinking 模型
-            if "claude-sonnet-4-6" in data.get('models', {}):
-                model = Model(
-                    id='claude-sonnet-4-6-thinking',
-                    object='model',
-                    created=current_timestamp,
-                    owned_by='google'
-                )
-                model_list.append(model_to_dict(model))
-            # 添加额外的 claude-opus-4-6 模型
-            if "claude-opus-4-6-thinking" in data.get('models', {}):
-                claude_opus_model = Model(
-                    id='claude-opus-4-6',
-                    object='model',
-                    created=current_timestamp,
-                    owned_by='google'
-                )
-                model_list.append(model_to_dict(claude_opus_model))
-
-            log.info(f"[ANTIGRAVITY] Fetched {len(model_list)} available models")
-            return model_list
-        else:
+        if response.status_code != 200:
             log.error(f"[ANTIGRAVITY] Failed to fetch models ({response.status_code}): {response.text[:500]}")
-            return []
-
+            return None
+        data = response.json()
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, dict):
+            log.warning("[ANTIGRAVITY] 模型能力响应缺少 models 字典")
+            return None
+        return frozenset(
+            model_id for model_id, info in models.items()
+            if isinstance(model_id, str) and "disabled" not in model_id.lower()
+            and not (isinstance(info, dict) and (
+                info.get("disabled") is True or info.get("isDisabled") is True
+            ))
+        )
     except Exception as e:
         log.error(f"[ANTIGRAVITY] Failed to fetch models: {e}")
-        log.error(f"[ANTIGRAVITY] Traceback: {traceback.format_exc()}")
-        return []
+        return None
+
+
+async def fetch_available_models() -> List[Dict[str, Any]]:
+    """将所有启用凭证的模型并集转为 OpenAI 格式，并保留已有 Claude 别名。"""
+    model_ids = {model_id for model_id in await get_available_model_ids()
+                 if _is_listable_model(model_id)}
+    if "claude-sonnet-4-6" in model_ids:
+        model_ids.add("claude-sonnet-4-6-thinking")
+    if "claude-opus-4-6-thinking" in model_ids:
+        model_ids.add("claude-opus-4-6")
+    current_timestamp = int(datetime.now(timezone.utc).timestamp())
+    return [model_to_dict(Model(
+        id=model_id, object="model", created=current_timestamp, owned_by="google"
+    )) for model_id in sorted(model_ids)]
 
 
 async def fetch_quota_info(access_token: str, project_id: str = "") -> Dict[str, Any]:

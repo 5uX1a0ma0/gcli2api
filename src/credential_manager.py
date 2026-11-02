@@ -3,22 +3,86 @@
 以 email 为唯一键管理 Antigravity 凭证：负载均衡选取、自动 token 刷新、错误记录与模型级冷却。
 
 全部函数直接使用全局数据库单例（get_database），无实例状态；
-唯一的状态是 sticky 模式的当前粘性凭证指针（进程内模块级变量）。
+进程内保存 sticky 凭证指针及按凭证查询的模型能力缓存。
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from log import log
 
-from config import get_credential_select_mode
+from config import get_antigravity_api_url, get_credential_select_mode
 from src import session_cache
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
 
-# sticky 模式的当前粘性凭证（进程内唯一状态；重置函数供测试使用）
+# sticky 模式的当前粘性凭证（进程内指针；重置函数供测试使用）
 _sticky_email: Optional[str] = None
+
+# (API 地址、project、token) 变化时重新识别；查询失败短暂缓存并保留已有结果。
+_MODEL_CACHE_TTL = 300.0
+_MODEL_CACHE_FAILURE_TTL = 30.0
+_model_cache: Dict[
+    str, Tuple[Tuple[str, str, str], float, Optional[frozenset[str]]]
+] = {}
+_model_cache_locks: Dict[str, asyncio.Lock] = {}
+
+
+def invalidate_model_cache(email: str) -> None:
+    """模型不存在或凭证被替换时，下一次选取重新查询能力。"""
+    _model_cache.pop(email, None)
+
+
+async def get_credential_model_ids(
+    email: str, credential_data: Dict[str, Any]
+) -> Optional[frozenset[str]]:
+    """返回该凭证的真实上游模型 ID；None 表示暂时无法识别，而非免费凭证。"""
+    api_url = await get_antigravity_api_url()
+    access_token = credential_data.get("access_token") or credential_data.get("token") or ""
+    project_id = credential_data.get("project_id") or ""
+    cache_key = (api_url, project_id, access_token)
+    cached = _model_cache.get(email)
+    if cached and cached[0] == cache_key and time.monotonic() < cached[1]:
+        return cached[2]
+
+    lock = _model_cache_locks.setdefault(email, asyncio.Lock())
+    async with lock:
+        cached = _model_cache.get(email)
+        if cached and cached[0] == cache_key and time.monotonic() < cached[1]:
+            return cached[2]
+
+        # 延迟导入，避免 API 层与凭证管理的模块初始化循环。
+        from src.api.antigravity import fetch_credential_model_ids
+
+        model_ids = await fetch_credential_model_ids(access_token, project_id, api_url)
+        ttl = _MODEL_CACHE_TTL if model_ids is not None else _MODEL_CACHE_FAILURE_TTL
+        if model_ids is None and cached and cached[0] == cache_key:
+            model_ids = cached[2]
+        _model_cache[email] = (cache_key, time.monotonic() + ttl, model_ids)
+        return model_ids
+
+
+async def get_available_model_ids() -> frozenset[str]:
+    """汇总所有启用凭证的模型能力，不依赖账户 Tier 或会话/粘性选择模式。"""
+    database = await get_database()
+    states = await database.get_all_credential_states()
+    semaphore = asyncio.Semaphore(8)
+
+    async def collect(email: str) -> frozenset[str]:
+        async with semaphore:
+            result = await database.get_available_credential_by_email(email)
+            if result:
+                result = await _validate_or_refresh(*result)
+            if not result:
+                return frozenset()
+            return await get_credential_model_ids(*result) or frozenset()
+
+    results = await asyncio.gather(*(
+        collect(email) for email, state in states.items() if not state.get("disabled")
+    ))
+    return frozenset().union(*results)
 
 
 def _reset_sticky() -> None:
@@ -32,9 +96,10 @@ def _reset_sticky() -> None:
 async def get_valid_credential(
     model_name: Optional[str] = None,
     session_key: Optional[str] = None,
+    excluded_emails: Optional[set[str]] = None,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
-    获取可用凭证：按凭证选择模式选取，自动跳过禁用/冷却凭证。
+    获取可用凭证：按选择模式选取，跳过禁用/冷却/不支持目标模型的凭证。
     Token 失效时自动刷新；刷新失败（凭证永久失效）自动禁用并尝试下一个。
 
     凭证选择模式（config: credential_select_mode）:
@@ -48,19 +113,23 @@ async def get_valid_credential(
     global _sticky_email
     database = await get_database()
     mode = await get_credential_select_mode()
+    excluded = set(excluded_emails or ())
 
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:
         bound_email = await session_cache.get_session_binding(session_key)
         if bound_email:
-            result = await database.get_available_credential_by_email(
-                bound_email, model_name=model_name
-            )
+            result = None
+            if bound_email not in excluded:
+                result = await database.get_available_credential_by_email(
+                    bound_email, model_name=model_name
+                )
             if result:
                 log.debug(f"会话缓存命中: {bound_email}")
-                final = await _validate_or_refresh(result[0], result[1])
+                excluded.add(bound_email)
+                final = await _validate_or_refresh(*result, model_name=model_name)
                 if final is None:
-                    # 绑定凭证 token 永久失效等，解绑走正常选取
+                    # 绑定凭证失效或不支持模型，解绑走正常选取
                     await session_cache.delete_session_binding(session_key)
                 else:
                     return final
@@ -70,55 +139,55 @@ async def get_valid_credential(
 
     # sticky 模式：优先当前粘性凭证
     if mode == "sticky" and _sticky_email:
-        result = await database.get_available_credential_by_email(
-            _sticky_email, model_name=model_name
-        )
+        result = None
+        if _sticky_email not in excluded:
+            result = await database.get_available_credential_by_email(
+                _sticky_email, model_name=model_name
+            )
         if result:
-            final = await _validate_or_refresh(result[0], result[1])
+            excluded.add(result[0])
+            final = await _validate_or_refresh(*result, model_name=model_name)
             if final is not None:
                 return final
         # 粘性凭证 CD/禁用/失效，清除指针换新
         _sticky_email = None
 
     # 通用随机选取（random 模式 / cache 未命中 / sticky 无可用粘性凭证）
-    max_retries = 3
-    for attempt in range(max_retries):
-        result = await database.get_next_available_credential(model_name=model_name)
+    # 每个候选最多尝试一次；不支持模型的凭证数量不能限制可用凭证的发现。
+    while True:
+        result = await database.get_next_available_credential(
+            model_name=model_name, excluded_emails=excluded
+        )
 
         if not result:
-            if attempt == 0:
-                log.warning(f"没有可用凭证 (model_name={model_name})")
+            log.warning(f"没有可用凭证 (model_name={model_name})")
             return None
 
         email, credential_data = result
 
-        if await should_refresh_token(credential_data):
-            log.debug(f"Token需要刷新: {email}")
-            refreshed = await refresh_token(credential_data, email)
-            if refreshed:
-                await _after_picked(mode, email, session_key)
-                return email, refreshed
-            log.warning(
-                f"Token刷新失败，尝试下一个凭证: {email} (attempt={attempt + 1}/{max_retries})"
-            )
+        excluded.add(email)
+        final = await _validate_or_refresh(email, credential_data, model_name=model_name)
+        if final is None:
             continue
 
         await _after_picked(mode, email, session_key)
-        return email, credential_data
-
-    log.error(f"重试{max_retries}次后仍无可用凭证 (model_name={model_name})")
-    return None
+        return final
 
 
 async def _validate_or_refresh(
-    email: str, credential_data: Dict[str, Any]
+    email: str, credential_data: Dict[str, Any], model_name: Optional[str] = None
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """对已选中的凭证做 token 校验；需要刷新则刷新并返回，永久失效返回 None"""
+    """校验/刷新 token 并检查目标模型能力；失效或不支持模型返回 None。"""
     if await should_refresh_token(credential_data):
         refreshed = await refresh_token(credential_data, email)
         if refreshed is None:
             return None
         credential_data = refreshed
+    if model_name:
+        model_ids = await get_credential_model_ids(email, credential_data)
+        if model_ids is not None and model_name not in model_ids:
+            log.debug(f"跳过不支持模型的凭证: {email}, model={model_name}")
+            return None
     return email, credential_data
 
 
@@ -140,6 +209,7 @@ async def add_credential(email: str, credential_data: Dict[str, Any]):
     """新增或更新凭证（同 email 覆盖，自动去重）"""
     database = await get_database()
     await database.store_credential(email, credential_data)
+    invalidate_model_cache(email)
     log.info(f"Credential added/updated: {email}")
 
 
@@ -148,6 +218,7 @@ async def remove_credential(email: str) -> bool:
     database = await get_database()
     try:
         await database.delete_credential(email)
+        invalidate_model_cache(email)
         log.info(f"Credential removed: {email}")
         return True
     except Exception as e:

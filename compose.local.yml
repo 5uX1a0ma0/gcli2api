@@ -1,0 +1,8 @@
+services:
+  agy2api:
+    image: agy2api:model-routing
+    platform: linux/amd64
+    pull_policy: never
+    build:
+      context: ${AGY2API_SOURCE_DIR:-.}
+      dockerfile: Dockerfile

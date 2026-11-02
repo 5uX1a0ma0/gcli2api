@@ -93,6 +93,45 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
     docker-compose up -d
     ```
 
+**从源码构建本分支（x64 Linux，Docker Compose v2）**
+
+`model-routing` 分支包含按凭证可用模型自动分流的修改。`compose.local.yml` 使用本地源码构建镜像，前端产物已包含在 `dist/` 中。
+
+新部署可在克隆后的源码目录运行：
+
+```bash
+git clone --branch model-routing --single-branch https://github.com/5uX1a0ma0/gcli2api.git
+cd gcli2api
+docker compose -f docker-compose.yml -f compose.local.yml up -d --build
+```
+
+已有 Compose 部署时，在**原 Compose 项目目录**中克隆源码并构建，原服务在构建期间继续运行：
+
+```bash
+git clone --branch model-routing --single-branch https://github.com/5uX1a0ma0/gcli2api.git agy2api-source
+export AGY2API_SOURCE_DIR="$PWD/agy2api-source"
+docker compose -f docker-compose.yml -f agy2api-source/compose.local.yml build agy2api
+```
+
+构建成功后，停止服务并备份原数据，再启动新镜像。以下使用默认数据目录 `data/`，自定义挂载时请备份实际宿主机目录；PostgreSQL 按原方式备份数据库：
+
+```bash
+docker compose -f docker-compose.yml stop agy2api
+tar -czf "/tmp/agy2api-backup-$(date +%Y%m%d-%H%M%S).tar.gz" data
+docker compose -f docker-compose.yml -f agy2api-source/compose.local.yml up -d --no-deps agy2api
+docker compose -f docker-compose.yml -f agy2api-source/compose.local.yml logs --tail=100 agy2api
+```
+
+覆盖配置保留原 Compose 的环境变量、网络和数据卷。上述示例以 `docker-compose.yml` 和服务名 `agy2api` 为准，实际名称不同时按原部署替换。分流改动没有新增数据库字段，模型能力缓存将在首次请求或查询模型列表时建立。
+
+后续更新先运行 `git -C agy2api-source pull --ff-only`，然后重新构建并启动。每次操作继续使用两个 `-f` 参数，并设置 `AGY2API_SOURCE_DIR`；也可在原项目 `.env` 中加入 `AGY2API_SOURCE_DIR=./agy2api-source`，持久保存源码目录设置。
+
+回退到原镜像：
+
+```bash
+docker compose -f docker-compose.yml up -d --no-deps --pull never agy2api
+```
+
 ## 核心功能
 
 ### 🔄 API 端点和格式支持
@@ -108,6 +147,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 ### 📊 智能凭证管理系统
 
 - 多个 Google OAuth 凭证自动轮换（随机负载均衡）
+- 按每个凭证的实际可用模型自动分流，兼容免费/付费凭证混用，与账户 PRO/ULTRA 等级无关
 - 模型级冷却（429 错误自动设置对应模型家族的 CD：argon / gemini / claude+gpt 共享冷却）
 - 自动故障检测和凭证禁用
 - 凭证使用统计和配额/额度查询
@@ -133,10 +173,14 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 
 ## 支持的模型
 
-模型列表从 Antigravity API 动态获取，支持所有 Antigravity 模型：
+模型列表按凭证调用 Antigravity `fetchAvailableModels` 动态获取，对外返回所有启用凭证的模型并集。请求按转换后的真实上游模型 ID 选择凭证，随机、会话缓存和粘性模式均会跳过不支持该模型的凭证。
 
-- **Claude 系列**：`claude-sonnet-4-5`、`claude-opus-4-5` 等
-- **Gemini 系列**：`gemini-2.5-flash`、`gemini-3-flash-preview` 等
+识别结果使用进程内缓存（5 分钟），凭证 Token、Project ID 或 API 地址变化后重新获取。查询失败保留已有结果，尚未识别的凭证暂按未知能力尝试，30 秒后重新查询；明确的“模型不存在”400 会刷新识别缓存并换用其他凭证，每个失配凭证在同一次请求中最多尝试一次。此类分流不占用 429 重试次数，也不会触发整张凭证的自动禁用。
+
+支持的模型以实际返回的列表为准，例如：
+
+- **Claude 系列**：`claude-sonnet-4-6`、`claude-opus-5-5-high` 等
+- **Gemini 系列**：`gemini-3.8-flash`、`gemini-4-argon-high` 等
 
 **特殊功能变体：**
 - **抗截断模式**：在模型名称前添加 `抗截断-` 前缀

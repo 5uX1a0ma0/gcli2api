@@ -374,7 +374,7 @@ class Database:
             return False
 
     async def get_next_available_credential(
-        self, model_name: Optional[str] = None
+        self, model_name: Optional[str] = None, excluded_emails: Optional[set[str]] = None
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """随机获取一个可用凭证（负载均衡 + 模型家族级冷却过滤），返回 (email, credential)"""
         current_time = time.time()
@@ -388,6 +388,8 @@ class Database:
                 )
             ).all()
             for row in rows:
+                if excluded_emails and row.email in excluded_emails:
+                    continue
                 if cd_group:
                     cooldowns = _load_json(row.model_cooldowns, {})
                     cd = cooldowns.get(cd_group)
