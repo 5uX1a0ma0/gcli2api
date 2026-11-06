@@ -27,7 +27,7 @@ from src.credential_manager import (
     add_credential,
     get_available_model_ids,
     get_valid_credential,
-    invalidate_model_cache,
+    mark_credential_model_unavailable,
 )
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
@@ -498,7 +498,7 @@ async def stream_request(
 
                     if _is_model_not_found_error(status_code, last_error_body):
                         excluded_emails.add(current_file)
-                        invalidate_model_cache(current_file)
+                        await mark_credential_model_unavailable(current_file, model_name)
                         await record_api_call_error(
                             current_file, status_code, model_name=model_name,
                             error_message=last_error_body,
@@ -889,7 +889,7 @@ async def non_stream_request(
 
                 if _is_model_not_found_error(status_code, error_text):
                     excluded_emails.add(current_file)
-                    invalidate_model_cache(current_file)
+                    await mark_credential_model_unavailable(current_file, model_name)
                     await record_api_call_error(
                         current_file, status_code, model_name=model_name,
                         error_message=error_text,

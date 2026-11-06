@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from fastapi import Response
+from fastapi import FastAPI, Response
 
 import config
 from src import credential_manager as manager, session_cache
@@ -22,6 +22,7 @@ with patch("httpx.get", return_value=httpx.Response(
 )):
     from src.api import antigravity as api
     from src.converter.antigravity_fix import resolve_profile
+    from src.panel import creds as panel
     from src.router.antigravity.model_list import get_antigravity_models_with_features
 
 
@@ -91,6 +92,7 @@ async def env(monkeypatch, tmp_path):
     await database.initialize()
     upstream = Upstream()
     monkeypatch.setattr(manager, "get_database", AsyncMock(return_value=database))
+    monkeypatch.setattr(panel, "get_database", AsyncMock(return_value=database))
     monkeypatch.setattr(api, "post_async", upstream.post)
     monkeypatch.setattr(api, "stream_post_async", upstream.stream)
     for name in ("record_usage_log", "record_api_call_success", "record_api_call_error"):
@@ -126,6 +128,14 @@ def request_body(model=NEW_CLAUDE):
     return {"model": model, "request": {
         "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
     }}
+
+
+def panel_app(authenticated=True):
+    app = FastAPI()
+    app.include_router(panel.router)
+    if authenticated:
+        app.dependency_overrides[panel.verify_panel_token] = lambda: "test-token"
+    return app
 
 
 async def call_api(stream, body=None):
@@ -276,6 +286,91 @@ async def test_concurrent_queries_share_one_probe(env):
     assert len(env.upstream.probes) == 1
 
 
+@pytest.mark.parametrize("models,tier,paid", [
+    ([OLD_CLAUDE, FLASH], "ultra", False),
+    ([NEW_CLAUDE, FLASH], "free", True),
+    ([GEMINI4], "free", True),
+    (["claude-sonnet-5-5-low", OLD_CLAUDE], "free", True),
+    ([FLASH], "pro", None),
+    ([], "pro", None),
+    (None, "pro", None),
+])
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_panel_paid_marker_uses_cached_capabilities_without_generating(
+    env, models, tier, paid, disabled
+):
+    email, _ = await env.add("token", models, tier=tier)
+    await env.db.update_credential_state(email, {"disabled": disabled})
+    await env.db.set_model_cooldown(email, NEW_CLAUDE, time.time() + 3600)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        for _ in range(2):
+            response = await client.get(f"/creds/model-status/{email}")
+            assert response.status_code == 200
+            assert response.json() == {"email": email, "paid": paid}
+    assert len(env.upstream.probes) == 1
+    assert not env.upstream.generated
+    state = await env.db.get_credential_state(email)
+    assert state["disabled"] is disabled
+    assert state["tier"] == tier
+
+
+async def test_panel_paid_marker_refreshes_tokens_and_preserves_credential_state(env, monkeypatch):
+    email, data = await env.add("expired", [OLD_CLAUDE], tier="ultra")
+    data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await env.db.store_credential(email, data)
+    await env.db.update_credential_state(email, {"disabled": True})
+    env.upstream.models["renewed"] = {NEW_CLAUDE: {}}
+
+    async def refresh(credentials):
+        credentials.access_token = "renewed"
+        credentials.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    monkeypatch.setattr(panel.Credentials, "refresh", refresh)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        response = await client.get(f"/creds/model-status/{email}")
+    assert response.json()["paid"] is True
+    saved = await env.db.get_credential(email)
+    assert saved["access_token"] == "renewed"
+    assert panel.Credentials.from_dict(saved).access_token == "renewed"
+    assert saved["project_id"] == data["project_id"]
+    state = await env.db.get_credential_state(email)
+    assert state["disabled"] is True and state["tier"] == "ultra"
+    assert not env.upstream.generated
+
+
+async def test_panel_paid_marker_keeps_failed_token_refresh_unknown(env, monkeypatch):
+    email, data = await env.add("expired", [OLD_CLAUDE])
+    data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await env.db.store_credential(email, data)
+    monkeypatch.setattr(panel.Credentials, "refresh", AsyncMock(side_effect=RuntimeError("offline")))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        response = await client.get(f"/creds/model-status/{email}")
+    assert response.status_code == 200 and response.json()["paid"] is None
+    assert not env.upstream.probes and not env.upstream.generated
+    assert (await env.db.get_credential_state(email))["disabled"] is False
+
+
+async def test_panel_paid_marker_requires_authentication_and_existing_credential(env):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app(authenticated=False)),
+        base_url="http://panel.test",
+    ) as client:
+        response = await client.get("/creds/model-status/missing@example.test")
+    assert response.status_code in (401, 403)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        response = await client.get("/creds/model-status/missing@example.test")
+    assert response.status_code == 404
+    assert not env.upstream.probes and not env.upstream.generated
+
+
 @pytest.mark.parametrize("alias", ["claude-sonnet-4-6-thinking", "claude-opus-4-6"])
 async def test_alias_uses_normalized_upstream_id_for_eligibility(env, alias):
     upstream = resolve_profile(alias).upstream
@@ -328,6 +423,202 @@ async def test_all_model_mismatches_stop_after_each_credential_once(env, stream)
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+@pytest.mark.parametrize("discovery_fails", [False, True])
+async def test_repeated_requests_skip_a_model_rejected_by_a_credential(
+    env, monkeypatch, stream, mode, discovery_fails
+):
+    first, _ = await env.add("first", None if discovery_fails else [NEW_CLAUDE, FLASH])
+    await env.add("second", [NEW_CLAUDE])
+    monkeypatch.setattr(storage, "func", SimpleNamespace(
+        random=lambda: storage.AntigravityCredential.id
+    ))
+    config._config_cache["credential_select_mode"] = mode
+    body = request_body()
+    env.upstream.outcomes["first"] = [(400, "Requested model not found.")] * 2
+
+    for _ in range(2):
+        manager._sticky_email = first
+        await session_cache.set_session_binding(api._derive_session_key(NEW_CLAUDE, body), first)
+        result = await call_api(stream, body)
+        assert isinstance(result, list) if stream else result.status_code == 200
+
+    assert [token for token, _ in env.upstream.generated] == ["first", "second", "second"]
+    assert (await env.db.get_credential_state(first))["disabled"] is False
+    # 只跳过被拒绝的模型，不影响该凭证的其他能力。
+    assert (await manager.get_valid_credential(FLASH))[0] == first
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_model_mismatch_stays_disabled_after_cache_expiry(env, monkeypatch, stream):
+    first, _ = await env.add("first", [NEW_CLAUDE])
+    await env.add("second", [NEW_CLAUDE])
+    monkeypatch.setattr(storage, "func", SimpleNamespace(
+        random=lambda: storage.AntigravityCredential.id
+    ))
+    now = [0.0]
+    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    await call_api(stream)
+    assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
+    for now[0] in (301, 86400, 86400 * 365):
+        assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
+
+
+@pytest.mark.parametrize("field", ["access_token", "project_id", "api_url"])
+async def test_model_mismatch_stays_disabled_after_configuration_changes(env, monkeypatch, field):
+    first, data = await env.add("first", [NEW_CLAUDE])
+    await env.add("second", [NEW_CLAUDE])
+    monkeypatch.setattr(storage, "func", SimpleNamespace(
+        random=lambda: storage.AntigravityCredential.id
+    ))
+    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    await call_api(False)
+    assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
+
+    if field == "api_url":
+        config._config_cache["antigravity_api_url"] = "https://new-antigravity.test"
+    else:
+        data[field] = "new"
+        env.upstream.models["new"] = {NEW_CLAUDE: {}}
+        await env.db.store_credential(first, data)
+    assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
+
+
+async def test_rediscovery_and_model_lists_keep_rejected_models_excluded(env, monkeypatch):
+    first, data = await env.add("first", [NEW_CLAUDE, FLASH])
+    second, _ = await env.add("second", [NEW_CLAUDE])
+    monkeypatch.setattr(storage, "func", SimpleNamespace(
+        random=lambda: storage.AntigravityCredential.id
+    ))
+    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    await call_api(False)
+    await env.db.update_credential_state(second, {"disabled": True})
+    # 上游列表仍包含被拒绝的模型，重新查询也不能恢复它。
+    assert await manager.get_credential_model_ids(first, data) == {FLASH}
+    assert {model["id"] for model in await api.fetch_available_models()} == {FLASH}
+    assert await manager.get_valid_credential(NEW_CLAUDE) is None
+    # 重新导入同一邮箱的凭证不会解除永久禁用。
+    await manager.add_credential(first, data)
+    assert await manager.get_valid_credential(NEW_CLAUDE) is None
+
+
+async def test_inflight_discovery_cannot_restore_a_rejected_model(env, monkeypatch):
+    email, data = await env.add("token", [NEW_CLAUDE, FLASH])
+    started, release = asyncio.Event(), asyncio.Event()
+    original = api.post_async
+
+    async def delayed_post(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(api, "post_async", delayed_post)
+    discovery = asyncio.create_task(manager.get_credential_model_ids(email, data))
+    await started.wait()
+    await manager.mark_credential_model_unavailable(email, NEW_CLAUDE)
+    release.set()
+    assert await discovery == {FLASH}
+    assert await manager.get_credential_model_ids(email, data) == {FLASH}
+    assert await manager.get_valid_credential(NEW_CLAUDE) is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+async def test_model_disable_survives_database_and_process_restart(env, monkeypatch, stream, mode):
+    first, _ = await env.add("first", [NEW_CLAUDE, FLASH])
+    await env.add("second", [NEW_CLAUDE])
+    monkeypatch.setattr(storage, "func", SimpleNamespace(
+        random=lambda: storage.AntigravityCredential.id
+    ))
+    config._config_cache["credential_select_mode"] = mode
+    body = request_body()
+    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    await call_api(stream, body)
+    await env.db.close()
+    manager._model_cache.clear()
+    manager._model_cache_locks.clear()
+    manager._reset_sticky()
+    session_cache._memory_store.clear()
+
+    restarted = storage.Database()
+    await restarted.initialize()
+    monkeypatch.setattr(manager, "get_database", AsyncMock(return_value=restarted))
+    try:
+        manager._sticky_email = first
+        await session_cache.set_session_binding(api._derive_session_key(NEW_CLAUDE, body), first)
+        result = await call_api(stream, body)
+        assert isinstance(result, list) if stream else result.status_code == 200
+        assert [token for token, _ in env.upstream.generated] == ["first", "second", "second"]
+        assert (await manager.get_valid_credential(FLASH))[0] == first
+        assert await restarted.get_disabled_model_ids(first) == {NEW_CLAUDE}
+    finally:
+        await restarted.close()
+
+
+async def test_concurrent_model_disables_are_idempotent_and_do_not_lose_models(env):
+    email, _ = await env.add("token", [NEW_CLAUDE, GEMINI4, FLASH])
+    await asyncio.gather(*(
+        manager.mark_credential_model_unavailable(email, model)
+        for model in [NEW_CLAUDE, GEMINI4] * 5
+    ))
+    assert await env.db.get_disabled_model_ids(email) == {NEW_CLAUDE, GEMINI4}
+    assert await manager.get_valid_credential(NEW_CLAUDE) is None
+    assert await manager.get_valid_credential(GEMINI4) is None
+    assert (await manager.get_valid_credential(FLASH))[0] == email
+    assert not env.upstream.generated
+
+
+async def test_other_database_workers_apply_permanent_disables_to_cached_models(env):
+    email, data = await env.add("token", [NEW_CLAUDE, FLASH])
+    assert await manager.get_credential_model_ids(email, data) == {NEW_CLAUDE, FLASH}
+    worker = storage.Database()
+    await worker.initialize()
+    try:
+        await worker.disable_credential_model(email, NEW_CLAUDE)
+        # 另一数据库连接写入后，已有的模型列表缓存也必须过滤该模型。
+        assert await manager.get_credential_model_ids(email, data) == {FLASH}
+        assert await manager.get_valid_credential(NEW_CLAUDE) is None
+        assert (await manager.get_valid_credential(FLASH))[0] == email
+        assert len(env.upstream.probes) == 1
+    finally:
+        await worker.close()
+
+
+async def test_model_disable_table_upgrade_preserves_existing_data(env):
+    email, data = await env.add("existing", [NEW_CLAUDE], tier="ultra")
+    await env.db.update_credential_state(email, {"disabled": True, "error_codes": [403]})
+    await env.db.set_config("existing-option", "keep")
+    await env.db.insert_usage_log({"credential_email": email, "status_code": 403})
+    before_data = await env.db.get_credential(email)
+    before_state = await env.db.get_credential_state(email)
+    # 模拟已经有凭证、配置和日志，但尚无模型禁用表的原版数据库。
+    async with env.db._engine.begin() as connection:
+        await connection.run_sync(storage.DisabledCredentialModel.__table__.drop)
+    await env.db.close()
+    await env.db.initialize()
+    assert await env.db.get_credential(email) == before_data
+    assert await env.db.get_credential_state(email) == before_state
+    assert await env.db.get_config("existing-option") == "keep"
+    async with env.db.session() as session:
+        assert await session.scalar(storage.select(storage.UsageLog.credential_email)) == email
+    await env.db.disable_credential_model(email, NEW_CLAUDE)
+    assert await env.db.get_disabled_model_ids(email) == {NEW_CLAUDE}
+
+
+async def test_permanently_disabled_model_does_not_refresh_an_expired_token(env, monkeypatch):
+    email, data = await env.add("expired", [NEW_CLAUDE])
+    data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await env.db.store_credential(email, data)
+    await manager.mark_credential_model_unavailable(email, NEW_CLAUDE)
+    refresh = AsyncMock()
+    monkeypatch.setattr(manager, "refresh_token", refresh)
+    assert await manager.get_valid_credential(NEW_CLAUDE) is None
+    refresh.assert_not_awaited()
+    assert not env.upstream.probes and not env.upstream.generated
+
+
+@pytest.mark.parametrize("stream", [False, True])
 async def test_ordinary_400_keeps_existing_error_handling(env, stream):
     email, _ = await env.add("token", [NEW_CLAUDE])
     env.upstream.outcomes["token"] = [(400, "Invalid thought_signature for model.")]
@@ -335,6 +626,7 @@ async def test_ordinary_400_keeps_existing_error_handling(env, stream):
     assert result.status_code == 400
     assert len(env.upstream.generated) == 1
     assert email in manager._model_cache
+    assert await env.db.get_disabled_model_ids(email) == set()
 
 
 @pytest.mark.parametrize("stream", [False, True])

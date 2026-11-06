@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from log import log
 from src.credential_manager import (
     add_credential,
+    get_credential_model_ids,
+    get_model_paid_status,
     remove_credential,
     set_cred_disabled,
 )
@@ -483,6 +485,29 @@ async def get_creds_status(
     except Exception as e:
         log.error(f"获取凭证状态失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/model-status/{email}")
+async def get_credential_model_status(
+    email: str, token: str = Depends(verify_panel_token)
+):
+    """查询模型能力以识别 Paid；复用路由缓存，不执行模型生成请求。"""
+    database = await get_database()
+    credential_data = await database.get_credential(email)
+    if not credential_data:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+
+    paid = None
+    try:
+        credentials = Credentials.from_dict(credential_data)
+        if await credentials.refresh_if_needed():
+            credential_data.update(credentials.to_dict())
+            await database.store_credential(email, credential_data)
+        model_ids = await get_credential_model_ids(email, credential_data)
+        paid = get_model_paid_status(model_ids)
+    except Exception as e:
+        log.warning(f"识别凭证模型能力失败 {email}: {e}")
+    return JSONResponse(content={"email": email, "paid": paid})
 
 
 @router.post("/action")

@@ -122,7 +122,7 @@ docker compose -f docker-compose.yml -f agy2api-source/compose.local.yml up -d -
 docker compose -f docker-compose.yml -f agy2api-source/compose.local.yml logs --tail=100 agy2api
 ```
 
-覆盖配置保留原 Compose 的环境变量、网络和数据卷。上述示例以 `docker-compose.yml` 和服务名 `agy2api` 为准，实际名称不同时按原部署替换。分流改动没有新增数据库字段，模型能力缓存将在首次请求或查询模型列表时建立。
+覆盖配置保留原 Compose 的环境变量、网络和数据卷。上述示例以 `docker-compose.yml` 和服务名 `agy2api` 为准，实际名称不同时按原部署替换。分流改动新增独立的模型禁用记录表，启动时自动创建并保留现有凭证数据；模型能力缓存将在首次请求或查询模型列表时建立。
 
 后续更新先运行 `git -C agy2api-source pull --ff-only`，然后重新构建并启动。每次操作继续使用两个 `-f` 参数，并设置 `AGY2API_SOURCE_DIR`；也可在原项目 `.env` 中加入 `AGY2API_SOURCE_DIR=./agy2api-source`，持久保存源码目录设置。
 
@@ -148,6 +148,7 @@ docker compose -f docker-compose.yml up -d --no-deps --pull never agy2api
 
 - 多个 Google OAuth 凭证自动轮换（随机负载均衡）
 - 按每个凭证的实际可用模型自动分流，兼容免费/付费凭证混用，与账户 PRO/ULTRA 等级无关
+- 凭证管理页显示 Paid / Non-paid / 未识别标记，按可用模型能力识别，模型列表查询不会执行模型生成请求
 - 模型级冷却（429 错误自动设置对应模型家族的 CD：argon / gemini / claude+gpt 共享冷却）
 - 自动故障检测和凭证禁用
 - 凭证使用统计和配额/额度查询
@@ -175,7 +176,9 @@ docker compose -f docker-compose.yml up -d --no-deps --pull never agy2api
 
 模型列表按凭证调用 Antigravity `fetchAvailableModels` 动态获取，对外返回所有启用凭证的模型并集。请求按转换后的真实上游模型 ID 选择凭证，随机、会话缓存和粘性模式均会跳过不支持该模型的凭证。
 
-识别结果使用进程内缓存（5 分钟），凭证 Token、Project ID 或 API 地址变化后重新获取。查询失败保留已有结果，尚未识别的凭证暂按未知能力尝试，30 秒后重新查询；明确的“模型不存在”400 会刷新识别缓存并换用其他凭证，每个失配凭证在同一次请求中最多尝试一次。此类分流不占用 429 重试次数，也不会触发整张凭证的自动禁用。
+识别结果使用进程内缓存（5 分钟），凭证 Token、Project ID 或 API 地址变化后重新获取。查询失败保留已有结果，尚未识别的凭证暂按未知能力尝试，30 秒后重新查询；明确的“模型不存在”400 会永久禁用该凭证下对应的真实模型 ID，并换用其他凭证，每个失配凭证在同一次请求中最多尝试一次。禁用记录按邮箱和模型 ID 保存在 `disabled_credential_models` 表中，即使模型列表仍宣称可用或查询失败，后续请求也会跳过它；重启、缓存过期、Token/Project/API 地址变化及同邮箱凭证重新导入都不会自动解除禁用。该凭证的其他模型，以及其他凭证支持的同名模型继续可用。此类分流不占用 429 重试次数，也不会触发整张凭证的自动禁用；参数、工具和签名等普通 400 错误保持原有处理。
+
+凭证管理页独立加载 Paid 标记，复用同一份模型能力缓存。当前以 Claude 5.5 或 Gemini 4 模型识别为 Paid；没有这些模型但识别到 Claude 4.6 时显示 Non-paid。查询失败、空列表或仅识别到共享模型时显示“Paid 未识别”。此标记描述已识别的模型能力，账户 PRO/ULTRA 等级仍单独显示。
 
 支持的模型以实际返回的列表为准，例如：
 

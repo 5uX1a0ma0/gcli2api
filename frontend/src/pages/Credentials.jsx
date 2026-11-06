@@ -38,6 +38,7 @@ export default function Credentials() {
   // 额度预览相关状态
   const [quotaModal, setQuotaModal] = useState(null); // { email } 额度弹窗
   const [quotaCache, setQuotaCache] = useState({}); // 缓存额度数据 { email: { claude, gemini } | { error } }
+  const [modelStatuses, setModelStatuses] = useState({});
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
@@ -72,6 +73,33 @@ export default function Credentials() {
   useEffect(() => {
     fetchCreds();
   }, [fetchCreds]);
+
+  // 独立加载模型能力，列表和筛选不必等待上游查询；换页时取消旧查询。
+  useEffect(() => {
+    const controller = new AbortController();
+    setModelStatuses({});
+    let next = 0;
+    const lookup = async () => {
+      while (next < items.length && !controller.signal.aborted) {
+        const { email } = items[next++];
+        setModelStatuses((prev) => ({ ...prev, [email]: { loading: true } }));
+        let paid = null;
+        try {
+          const res = await api.get(`/creds/model-status/${encodeURIComponent(email)}`, {
+            signal: controller.signal,
+          });
+          paid = res.data.paid;
+        } catch {
+          // 识别失败保留未知，不能将它当作 Non-paid。
+        }
+        if (!controller.signal.aborted) {
+          setModelStatuses((prev) => ({ ...prev, [email]: { paid, loading: false } }));
+        }
+      }
+    };
+    for (let index = 0; index < Math.min(4, items.length); index++) lookup();
+    return () => controller.abort();
+  }, [items]);
 
   const showMessage = useCallback((type, text, title) => {
     setMessage({ type, text, title: title || (type === "success" ? "操作成功" : type === "error" ? "操作失败" : "提示") });
@@ -502,6 +530,8 @@ export default function Credentials() {
           {items.map((cred) => {
             const cooldownText = getCooldownText(cred.model_cooldowns);
             const busy = busyFiles.has(cred.email);
+            const paid = modelStatuses[cred.email]?.paid;
+            const paidLoading = modelStatuses[cred.email]?.loading ?? true;
             return (
               <div
                 key={cred.email}
@@ -526,6 +556,20 @@ export default function Credentials() {
                         className={`text-xs px-2 py-0.5 rounded-full border ${tierStyle(cred.tier)}`}
                       >
                         {cred.tier || "pro"}
+                      </span>
+                      <span
+                        title={paidLoading ? "正在查询可用模型" : paid === true
+                          ? "按可用模型识别：包含付费模型能力" : paid === false
+                          ? "按可用模型识别：非付费模型能力" : "模型能力未识别，可刷新状态重试"}
+                        className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border ${
+                          paid === true ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                            : paid === false ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                            : "bg-dark-700 text-gray-400 border-dark-600"
+                        }`}
+                      >
+                        {paidLoading && <Loader2 size={12} className="animate-spin" />}
+                        {paidLoading ? "Paid 识别中" : paid === true ? "Paid"
+                          : paid === false ? "Non-paid" : "Paid 未识别"}
                       </span>
                       {cred.disabled ? (
                         <span className="text-red-400 text-xs flex items-center gap-1">

@@ -24,6 +24,8 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -70,6 +72,15 @@ class AntigravityCredential(Base):
     __table_args__ = (
         Index("idx_ag_disabled", "disabled"),
     )
+
+
+class DisabledCredentialModel(Base):
+    """永久禁用的凭证模型；同邮箱凭证更新或重新导入时保留记录。"""
+    __tablename__ = "disabled_credential_models"
+
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    model_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
 
 
 class ConfigItem(Base):
@@ -615,6 +626,26 @@ class Database:
                     "error_messages": _load_json(row.error_messages, []),
                 }
             return {"email": email, "error_codes": [], "error_messages": []}
+
+    # ---------- 模型永久禁用 ----------
+
+    async def disable_credential_model(self, email: str, model_name: str) -> None:
+        """原子追加模型禁用记录；并发或重复写入不会覆盖其他模型。"""
+        insert = postgresql_insert if self._backend_type == "postgresql" else sqlite_insert
+        statement = insert(DisabledCredentialModel).values(
+            email=email, model_name=model_name
+        ).on_conflict_do_nothing(index_elements=["email", "model_name"])
+        async with self.session() as s:
+            await s.execute(statement)
+
+    async def get_disabled_model_ids(self, email: str) -> frozenset[str]:
+        """直接查询持久禁用记录，使其他进程写入的禁用立即参与分流。"""
+        async with self.session() as s:
+            models = await s.scalars(
+                select(DisabledCredentialModel.model_name)
+                .where(DisabledCredentialModel.email == email)
+            )
+            return frozenset(models)
 
     # ---------- 模型级冷却 ----------
 

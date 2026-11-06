@@ -30,28 +30,50 @@ _model_cache: Dict[
 _model_cache_locks: Dict[str, asyncio.Lock] = {}
 
 
+def _model_cache_key(api_url: str, credential_data: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        api_url,
+        credential_data.get("project_id") or "",
+        credential_data.get("access_token") or credential_data.get("token") or "",
+    )
+
+
+async def mark_credential_model_unavailable(email: str, model_name: str) -> None:
+    """将明确被拒绝的模型永久禁用，重启和凭证更新后仍生效。"""
+    database = await get_database()
+    await database.disable_credential_model(email, model_name)
+    invalidate_model_cache(email)
+    log.warning(f"永久禁用凭证模型: {email}, model={model_name}")
+
+
 def invalidate_model_cache(email: str) -> None:
-    """模型不存在或凭证被替换时，下一次选取重新查询能力。"""
+    """清除模型能力缓存；数据库内的永久禁用记录继续保留。"""
     _model_cache.pop(email, None)
 
 
 async def get_credential_model_ids(
-    email: str, credential_data: Dict[str, Any]
+    email: str, credential_data: Dict[str, Any], api_url: Optional[str] = None
 ) -> Optional[frozenset[str]]:
     """返回该凭证的真实上游模型 ID；None 表示暂时无法识别，而非免费凭证。"""
-    api_url = await get_antigravity_api_url()
-    access_token = credential_data.get("access_token") or credential_data.get("token") or ""
-    project_id = credential_data.get("project_id") or ""
-    cache_key = (api_url, project_id, access_token)
+    api_url = api_url or await get_antigravity_api_url()
+    cache_key = _model_cache_key(api_url, credential_data)
+    _, project_id, access_token = cache_key
+
+    async def available(model_ids: Optional[frozenset[str]]) -> Optional[frozenset[str]]:
+        if model_ids is None:
+            return None
+        database = await get_database()
+        return model_ids - await database.get_disabled_model_ids(email)
+
     cached = _model_cache.get(email)
     if cached and cached[0] == cache_key and time.monotonic() < cached[1]:
-        return cached[2]
+        return await available(cached[2])
 
     lock = _model_cache_locks.setdefault(email, asyncio.Lock())
     async with lock:
         cached = _model_cache.get(email)
         if cached and cached[0] == cache_key and time.monotonic() < cached[1]:
-            return cached[2]
+            return await available(cached[2])
 
         # 延迟导入，避免 API 层与凭证管理的模块初始化循环。
         from src.api.antigravity import fetch_credential_model_ids
@@ -61,7 +83,21 @@ async def get_credential_model_ids(
         if model_ids is None and cached and cached[0] == cache_key:
             model_ids = cached[2]
         _model_cache[email] = (cache_key, time.monotonic() + ttl, model_ids)
-        return model_ids
+        return await available(model_ids)
+
+
+def get_model_paid_status(model_ids: Optional[frozenset[str]]) -> Optional[bool]:
+    """用已知的专属模型识别 Paid；仅共享模型或查询失败时保留未知。"""
+    if not model_ids:
+        return None
+    normalized = {model_id.lower().replace(".", "-") for model_id in model_ids}
+    paid_prefixes = ("claude-opus-5-5", "claude-sonnet-5-5", "gemini-4-")
+    non_paid_prefixes = ("claude-sonnet-4-6", "claude-opus-4-6")
+    if any(model_id.startswith(paid_prefixes) for model_id in normalized):
+        return True
+    if any(model_id.startswith(non_paid_prefixes) for model_id in normalized):
+        return False
+    return None
 
 
 async def get_available_model_ids() -> frozenset[str]:
@@ -178,6 +214,10 @@ async def _validate_or_refresh(
     email: str, credential_data: Dict[str, Any], model_name: Optional[str] = None
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """校验/刷新 token 并检查目标模型能力；失效或不支持模型返回 None。"""
+    database = await get_database()
+    if model_name and model_name in await database.get_disabled_model_ids(email):
+        log.debug(f"跳过永久禁用的凭证模型: {email}, model={model_name}")
+        return None
     if await should_refresh_token(credential_data):
         refreshed = await refresh_token(credential_data, email)
         if refreshed is None:
@@ -185,7 +225,9 @@ async def _validate_or_refresh(
         credential_data = refreshed
     if model_name:
         model_ids = await get_credential_model_ids(email, credential_data)
-        if model_ids is not None and model_name not in model_ids:
+        if (model_ids is not None and model_name not in model_ids) or (
+            model_ids is None and model_name in await database.get_disabled_model_ids(email)
+        ):
             log.debug(f"跳过不支持模型的凭证: {email}, model={model_name}")
             return None
     return email, credential_data
