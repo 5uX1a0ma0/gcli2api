@@ -79,6 +79,12 @@ async def get_credential_model_ids(
         from src.api.antigravity import fetch_credential_model_ids
 
         model_ids = await fetch_credential_model_ids(access_token, project_id, api_url)
+        if model_ids is not None:
+            database = await get_database()
+            await database.update_credential_state(email, {
+                "paid": get_model_paid_status(await available(model_ids)),
+                "paid_checked_at": time.time(),
+            })
         ttl = _MODEL_CACHE_TTL if model_ids is not None else _MODEL_CACHE_FAILURE_TTL
         if model_ids is None and cached and cached[0] == cache_key:
             model_ids = cached[2]

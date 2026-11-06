@@ -19,6 +19,7 @@ from src.credential_manager import (
     add_credential,
     get_credential_model_ids,
     get_model_paid_status,
+    invalidate_model_cache,
     remove_credential,
     set_cred_disabled,
 )
@@ -300,7 +301,8 @@ async def upload_credentials_common( files: List[UploadFile] ) -> JSONResponse:
 
 async def get_creds_status_common(
     offset: int, limit: int, status_filter: str,
-    error_code_filter: str = None, cooldown_filter: str = None, tier_filter: str = None
+    error_code_filter: str = None, cooldown_filter: str = None, tier_filter: str = None,
+    paid_filter: str = None,
 ) -> JSONResponse:
     """获取凭证状态"""
     if offset < 0:
@@ -313,6 +315,8 @@ async def get_creds_status_common(
         raise HTTPException(status_code=400, detail="cooldown_filter 只能是 all、in_cooldown 或 no_cooldown")
     if tier_filter and tier_filter not in ["all", "free", "pro", "ultra"]:
         raise HTTPException(status_code=400, detail="tier_filter 只能是 all、free、pro 或 ultra")
+    if paid_filter and paid_filter not in ["all", "paid", "non_paid", "unknown"]:
+        raise HTTPException(status_code=400, detail="paid_filter 只能是 all、paid、non_paid 或 unknown")
 
     database = await get_database()
     result = await database.get_credentials_summary(
@@ -321,7 +325,8 @@ async def get_creds_status_common(
         status_filter=status_filter,
         error_code_filter=error_code_filter if error_code_filter and error_code_filter != "all" else None,
         cooldown_filter=cooldown_filter if cooldown_filter and cooldown_filter != "all" else None,
-        tier_filter=tier_filter if tier_filter and tier_filter != "all" else None
+        tier_filter=tier_filter if tier_filter and tier_filter != "all" else None,
+        paid_filter=paid_filter if paid_filter and paid_filter != "all" else None,
     )
 
     return JSONResponse(content={
@@ -471,14 +476,16 @@ async def get_creds_status(
     status_filter: str = "all",
     error_code_filter: str = "all",
     cooldown_filter: str = "all",
-    tier_filter: str = "all"):
+    tier_filter: str = "all",
+    paid_filter: str = "all"):
     """获取凭证状态（轻量级摘要，支持分页和状态筛选）"""
     try:
         return await get_creds_status_common(
             offset, limit, status_filter,
             error_code_filter=error_code_filter,
             cooldown_filter=cooldown_filter,
-            tier_filter=tier_filter
+            tier_filter=tier_filter,
+            paid_filter=paid_filter,
         )
     except HTTPException:
         raise
@@ -489,22 +496,28 @@ async def get_creds_status(
 
 @router.get("/model-status/{email}")
 async def get_credential_model_status(
-    email: str, token: str = Depends(verify_panel_token)
+    email: str, token: str = Depends(verify_panel_token), refresh: bool = False
 ):
-    """查询模型能力以识别 Paid；复用路由缓存，不执行模型生成请求。"""
+    """复用已保存的 Paid 结果；显式刷新时才重新查询模型能力。"""
     database = await get_database()
     credential_data = await database.get_credential(email)
     if not credential_data:
         raise HTTPException(status_code=404, detail="凭证不存在")
 
-    paid = None
+    state = await database.get_credential_state(email)
+    paid = state.get("paid")
+    if state.get("paid_checked_at") and not refresh:
+        return JSONResponse(content={"email": email, "paid": paid})
     try:
         credentials = Credentials.from_dict(credential_data)
         if await credentials.refresh_if_needed():
             credential_data.update(credentials.to_dict())
             await database.store_credential(email, credential_data)
+        if refresh:
+            invalidate_model_cache(email)
         model_ids = await get_credential_model_ids(email, credential_data)
-        paid = get_model_paid_status(model_ids)
+        if model_ids is not None:
+            paid = get_model_paid_status(model_ids)
     except Exception as e:
         log.warning(f"识别凭证模型能力失败 {email}: {e}")
     return JSONResponse(content={"email": email, "paid": paid})

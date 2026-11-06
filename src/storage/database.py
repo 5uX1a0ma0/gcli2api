@@ -65,6 +65,10 @@ class AntigravityCredential(Base):
     # tier 状态 (free/pro/ultra)
     tier: Mapped[Optional[str]] = mapped_column(String(32), default="pro")
 
+    # Paid 识别结果；时间戳区分尚未查询与已查询但无法识别。
+    paid: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    paid_checked_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     # 时间戳
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     updated_at: Mapped[float] = mapped_column(Float, default=time.time, onupdate=time.time)
@@ -257,9 +261,10 @@ class Database:
             if "filename" in existing_columns or "email" not in existing_columns:
                 log.info("检测到旧版凭证表结构（filename 键），重建为 email 键结构")
                 sync_conn.execute(text(f"DROP TABLE {table_name}"))
+                inspector = inspect(sync_conn)
 
         # 已存在的表补齐缺失列（ALTER TABLE ADD COLUMN，保留数据）
-        for orm_model in (UsageLog,):
+        for orm_model in (AntigravityCredential, UsageLog):
             table = orm_model.__table__
             if not inspector.has_table(table.name):
                 continue
@@ -440,7 +445,7 @@ class Database:
     ) -> bool:
         """更新凭证状态字段"""
         json_fields = {"error_codes", "error_messages", "model_cooldowns"}
-        float_fields = {"last_success"}
+        float_fields = {"last_success", "paid_checked_at"}
         str_fields = {"user_email", "tier", "project_id"}
         bool_fields = {"disabled"}
         async with self.session() as s:
@@ -452,6 +457,8 @@ class Database:
                     values[key] = float(value) if value is not None else None
                 elif key in str_fields:
                     values[key] = value
+                elif key == "paid":
+                    values[key] = bool(value) if value is not None else None
                 elif key in bool_fields:
                     values[key] = bool(value)
             if not values:
@@ -482,6 +489,8 @@ class Database:
                 "model_cooldowns": _load_json(row.model_cooldowns, {}),
                 "tier": row.tier or "pro",
                 "project_id": row.project_id or "",
+                "paid": row.paid,
+                "paid_checked_at": row.paid_checked_at,
             }
 
     async def get_all_credential_states(self) -> Dict[str, Dict[str, Any]]:
@@ -512,6 +521,7 @@ class Database:
         error_code_filter: Optional[str] = None,
         cooldown_filter: Optional[str] = None,
         tier_filter: Optional[str] = None,
+        paid_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """凭证摘要（分页 + 状态筛选，内存过滤）"""
         current_time = time.time()
@@ -550,6 +560,12 @@ class Database:
 
                 if filter_none and error_codes:
                     continue
+                if paid_filter == "paid" and row.paid is not True:
+                    continue
+                if paid_filter == "non_paid" and row.paid is not False:
+                    continue
+                if paid_filter == "unknown" and row.paid is not None:
+                    continue
                 if filter_value is not None:
                     match = False
                     for code in error_codes:
@@ -574,6 +590,8 @@ class Database:
                     "model_cooldowns": active_cooldowns,
                     "tier": row.tier or "pro",
                     "project_id": row.project_id or "",
+                    "paid": row.paid,
+                    "paid_checked_at": row.paid_checked_at,
                 }
                 if tier_filter and tier_filter in ("free", "pro", "ultra"):
                     if summary["tier"] != tier_filter:

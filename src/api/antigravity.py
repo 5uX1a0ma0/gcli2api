@@ -7,7 +7,6 @@ import asyncio
 import copy
 import hashlib
 import json
-import re
 import time
 import traceback
 import uuid
@@ -201,23 +200,9 @@ def _is_retryable_status(status_code: int, disable_error_codes: List[int]) -> bo
     return status_code in (429, 503) or status_code in disable_error_codes
 
 
-def _is_model_not_found_error(status_code: int, error_text: str) -> bool:
-    """只识别明确的模型不可用 400，参数/工具/签名错误不能触发模型分流。"""
-    if status_code != 400:
-        return False
-    try:
-        error = json.loads(error_text).get("error", {})
-        message = error.get("message", "")
-        if not isinstance(message, str):
-            return False
-        return bool(re.search(
-            r"\b(?:requested\s+)?model"
-            r"(?:\s+(?:[`\"'][^`\"']+[`\"']|[\w./:-]+))?"
-            r"\s+(?:is\s+)?(?:not\s+found|does\s+not\s+exist|not\s+available|not\s+supported)\b",
-            message, re.IGNORECASE,
-        ))
-    except (ValueError, AttributeError, TypeError):
-        return False
+def _is_model_not_found_error(status_code: int) -> bool:
+    """实际模型生成请求返回 HTTP 404 时，禁用该凭证下对应的模型。"""
+    return status_code == 404
 
 
 async def _switch_credential_for_retry(
@@ -496,7 +481,7 @@ async def stream_request(
                         error_body = ""
                     last_error_body = error_body or ""
 
-                    if _is_model_not_found_error(status_code, last_error_body):
+                    if _is_model_not_found_error(status_code):
                         excluded_emails.add(current_file)
                         await mark_credential_model_unavailable(current_file, model_name)
                         await record_api_call_error(
@@ -887,7 +872,7 @@ async def non_stream_request(
                     pass
                 last_error_body = error_text
 
-                if _is_model_not_found_error(status_code, error_text):
+                if _is_model_not_found_error(status_code):
                     excluded_emails.add(current_file)
                     await mark_credential_model_unavailable(current_file, model_name)
                     await record_api_call_error(

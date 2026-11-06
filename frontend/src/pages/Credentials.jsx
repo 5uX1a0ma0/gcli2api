@@ -29,6 +29,7 @@ export default function Credentials() {
   const [errorCodeFilter, setErrorCodeFilter] = useState("all");
   const [cooldownFilter, setCooldownFilter] = useState("all");
   const [tierFilter, setTierFilter] = useState("all");
+  const [paidFilter, setPaidFilter] = useState("all");
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(new Set());
   const [message, setMessage] = useState(null);
@@ -57,6 +58,7 @@ export default function Credentials() {
           error_code_filter: errorCodeFilter,
           cooldown_filter: cooldownFilter,
           tier_filter: tierFilter,
+          paid_filter: paidFilter,
         },
       });
       setItems(res.data.items);
@@ -68,20 +70,23 @@ export default function Credentials() {
     } finally {
       setLoading(false);
     }
-  }, [page, pageSize, statusFilter, errorCodeFilter, cooldownFilter, tierFilter]);
+  }, [page, pageSize, statusFilter, errorCodeFilter, cooldownFilter, tierFilter, paidFilter]);
 
   useEffect(() => {
     fetchCreds();
   }, [fetchCreds]);
 
-  // 独立加载模型能力，列表和筛选不必等待上游查询；换页时取消旧查询。
+  // 直接显示已保存的 Paid 状态，仅对尚未查询的凭证加载模型能力。
   useEffect(() => {
     const controller = new AbortController();
-    setModelStatuses({});
+    setModelStatuses(Object.fromEntries(items.map((cred) => [
+      cred.email, { paid: cred.paid, loading: !cred.paid_checked_at },
+    ])));
+    const pending = items.filter((cred) => !cred.paid_checked_at);
     let next = 0;
     const lookup = async () => {
-      while (next < items.length && !controller.signal.aborted) {
-        const { email } = items[next++];
+      while (next < pending.length && !controller.signal.aborted) {
+        const { email } = pending[next++];
         setModelStatuses((prev) => ({ ...prev, [email]: { loading: true } }));
         let paid = null;
         try {
@@ -97,7 +102,7 @@ export default function Credentials() {
         }
       }
     };
-    for (let index = 0; index < Math.min(4, items.length); index++) lookup();
+    for (let index = 0; index < Math.min(4, pending.length); index++) lookup();
     return () => controller.abort();
   }, [items]);
 
@@ -112,6 +117,20 @@ export default function Credentials() {
       else next.delete(email);
       return next;
     });
+  };
+
+  const refreshPaid = async (email) => {
+    setBusy(email, true);
+    setModelStatuses((prev) => ({ ...prev, [email]: { ...prev[email], loading: true } }));
+    try {
+      await api.get(`/creds/model-status/${encodeURIComponent(email)}`, { params: { refresh: true } });
+      await fetchCreds();
+    } catch (err) {
+      showMessage("error", err.response?.data?.detail || "刷新 Paid 失败");
+    } finally {
+      setModelStatuses((prev) => ({ ...prev, [email]: { ...prev[email], loading: false } }));
+      setBusy(email, false);
+    }
   };
 
   const doAction = async (email, action) => {
@@ -432,6 +451,7 @@ export default function Credentials() {
             { value: "none", label: "无错误" },
             { value: "400", label: "400" },
             { value: "403", label: "403" },
+            { value: "404", label: "404" },
             { value: "429", label: "429" },
             { value: "500", label: "500" },
           ]}
@@ -461,6 +481,20 @@ export default function Credentials() {
             { value: "free", label: "Free" },
             { value: "pro", label: "Pro" },
             { value: "ultra", label: "Ultra" },
+          ]}
+        />
+        <Select
+          value={paidFilter}
+          onChange={(v) => {
+            setPaidFilter(v);
+            setPage(1);
+          }}
+          className="w-full sm:w-32"
+          options={[
+            { value: "all", label: "Paid: 全部" },
+            { value: "paid", label: "Paid" },
+            { value: "non_paid", label: "Non-paid" },
+            { value: "unknown", label: "Paid 未识别" },
           ]}
         />
         <Select
@@ -530,8 +564,8 @@ export default function Credentials() {
           {items.map((cred) => {
             const cooldownText = getCooldownText(cred.model_cooldowns);
             const busy = busyFiles.has(cred.email);
-            const paid = modelStatuses[cred.email]?.paid;
-            const paidLoading = modelStatuses[cred.email]?.loading ?? true;
+            const paid = modelStatuses[cred.email]?.paid ?? cred.paid;
+            const paidLoading = modelStatuses[cred.email]?.loading ?? !cred.paid_checked_at;
             return (
               <div
                 key={cred.email}
@@ -557,10 +591,11 @@ export default function Credentials() {
                       >
                         {cred.tier || "pro"}
                       </span>
-                      <span
-                        title={paidLoading ? "正在查询可用模型" : paid === true
-                          ? "按可用模型识别：包含付费模型能力" : paid === false
-                          ? "按可用模型识别：非付费模型能力" : "模型能力未识别，可刷新状态重试"}
+                      <button
+                        type="button"
+                        onClick={() => refreshPaid(cred.email)}
+                        disabled={busy || paidLoading}
+                        title={paidLoading ? "正在查询可用模型" : "点击重新识别 Paid"}
                         className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border ${
                           paid === true ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
                             : paid === false ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
@@ -570,7 +605,7 @@ export default function Credentials() {
                         {paidLoading && <Loader2 size={12} className="animate-spin" />}
                         {paidLoading ? "Paid 识别中" : paid === true ? "Paid"
                           : paid === false ? "Non-paid" : "Paid 未识别"}
-                      </span>
+                      </button>
                       {cred.disabled ? (
                         <span className="text-red-400 text-xs flex items-center gap-1">
                           <Ban size={12} /> 禁用

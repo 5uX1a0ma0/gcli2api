@@ -30,6 +30,11 @@ FLASH = "gemini-3.8-flash"
 OLD_CLAUDE = "claude-sonnet-4-6"
 NEW_CLAUDE = "claude-opus-5-5-high"
 GEMINI4 = "gemini-4-argon-high"
+NOT_FOUND_ERROR = {"error": {
+    "code": 404,
+    "message": "Requested entity was not found.",
+    "status": "NOT_FOUND",
+}}
 
 
 class Upstream:
@@ -57,7 +62,9 @@ class Upstream:
         outcomes = self.outcomes.get(token, [])
         status, message = outcomes.pop(0) if outcomes else (200, "ok")
         if status != 200:
-            return httpx.Response(status, json={"error": {"message": message}})
+            return httpx.Response(status, json=message if isinstance(message, dict) else {
+                "error": {"message": message}
+            })
         return httpx.Response(200, json={
             "candidates": [{"content": {"role": "model", "parts": [{"text": message}]}}]
         })
@@ -245,7 +252,7 @@ async def test_successful_empty_list_and_missing_model_are_not_selected(env):
 async def test_cache_expires_recovers_and_retains_stale_result_on_failure(env, monkeypatch):
     email, data = await env.add("token", [OLD_CLAUDE])
     now = [0.0]
-    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
     assert await manager.get_credential_model_ids(email, data) == {OLD_CLAUDE}
     env.upstream.models["token"] = {NEW_CLAUDE: {}}
     now[0] = 299
@@ -371,6 +378,103 @@ async def test_panel_paid_marker_requires_authentication_and_existing_credential
     assert not env.upstream.probes and not env.upstream.generated
 
 
+@pytest.mark.parametrize("models,paid", [([NEW_CLAUDE], True), ([OLD_CLAUDE], False), ([FLASH], None)])
+async def test_panel_reentry_reuses_paid_status_after_cache_expiry_and_restart(env, monkeypatch, models, paid):
+    email, data = await env.add("token", models)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is paid
+        assert (await env.db.get_credential_state(email))["paid_checked_at"] is not None
+        manager._model_cache[email] = (manager._model_cache[email][0], -1, frozenset(models))
+        assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is paid
+        data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await env.db.store_credential(email, data)
+        refresh = AsyncMock(side_effect=RuntimeError("should not refresh a saved Paid result"))
+        monkeypatch.setattr(panel.Credentials, "refresh", refresh)
+        manager._model_cache.clear()
+        manager._model_cache_locks.clear()
+        await env.db.close()
+        await env.db.initialize()
+        for _ in range(2):
+            summary = (await client.get("/creds/status")).json()
+            assert summary["items"][0]["paid"] is paid
+            assert summary["items"][0]["paid_checked_at"] is not None
+            assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is paid
+    refresh.assert_not_awaited()
+    assert len(env.upstream.probes) == 1
+    assert not env.upstream.generated
+
+
+async def test_explicit_paid_refresh_updates_saved_status_and_preserves_it_on_failure(env):
+    email, _ = await env.add("token", [NEW_CLAUDE])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is True
+        env.upstream.models["token"] = {OLD_CLAUDE: {}}
+        assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is True
+        assert (await client.get(f"/creds/model-status/{email}?refresh=true")).json()["paid"] is False
+        saved = await env.db.get_credential_state(email)
+        env.upstream.models["token"] = None
+        assert (await client.get(f"/creds/model-status/{email}?refresh=true")).json()["paid"] is False
+        assert await env.db.get_credential_state(email) == saved
+    assert len(env.upstream.probes) == 3
+    assert not env.upstream.generated
+
+
+async def test_paid_filter_applies_before_pagination_and_combines_with_other_filters(env):
+    non_paid, _ = await env.add("non-paid", [OLD_CLAUDE], tier="ultra")
+    await manager.get_credential_model_ids(non_paid, await env.db.get_credential(non_paid))
+    unknown, _ = await env.add("unidentified", [FLASH])
+    checked_unknown, data = await env.add("shared-only", [FLASH])
+    await manager.get_credential_model_ids(checked_unknown, data)
+    paid_emails = []
+    for index in range(22):
+        email, _ = await env.add(f"paid-{index}", [NEW_CLAUDE], tier="free")
+        paid_emails.append(email)
+        await env.db.update_credential_state(email, {
+            "paid": True, "paid_checked_at": time.time(), "disabled": index == 21,
+            "error_codes": [404] if index == 20 else [],
+        })
+    await env.db.set_model_cooldown(paid_emails[20], NEW_CLAUDE, time.time() + 3600)
+    probes_before = len(env.upstream.probes)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        response = await client.get("/creds/status?paid_filter=paid&offset=20&limit=20")
+        assert response.status_code == 200
+        summary = response.json()
+        assert summary["total"] == 22 and summary["has_more"] is False
+        assert [item["email"] for item in summary["items"]] == paid_emails[20:]
+        assert summary["stats"] == {"total": 25, "normal": 24, "disabled": 1}
+        summary = (await client.get("/creds/status?paid_filter=non_paid")).json()
+        assert summary["total"] == 1 and summary["items"][0]["email"] == non_paid
+        summary = (await client.get("/creds/status?paid_filter=unknown")).json()
+        assert summary["total"] == 2
+        assert {item["email"] for item in summary["items"]} == {unknown, checked_unknown}
+        summary = (await client.get("/creds/status", params={
+            "paid_filter": "paid", "status_filter": "enabled", "tier_filter": "free",
+            "error_code_filter": "404", "cooldown_filter": "in_cooldown",
+        })).json()
+        assert summary["total"] == 1 and summary["items"][0]["email"] == paid_emails[20]
+        assert (await client.get("/creds/status?paid_filter=invalid")).status_code == 400
+    assert len(env.upstream.probes) == probes_before
+    assert not env.upstream.generated
+
+
+async def test_model_discovery_404_does_not_disable_any_model(env, monkeypatch):
+    email, _ = await env.add("token", [NEW_CLAUDE])
+    monkeypatch.setattr(api, "post_async", AsyncMock(return_value=httpx.Response(404, json=NOT_FOUND_ERROR)))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is None
+    assert (await env.db.get_credential_state(email))["paid_checked_at"] is None
+    assert await env.db.get_disabled_model_ids(email) == set()
+    assert not env.upstream.generated
+
+
 @pytest.mark.parametrize("alias", ["claude-sonnet-4-6-thinking", "claude-opus-4-6"])
 async def test_alias_uses_normalized_upstream_id_for_eligibility(env, alias):
     upstream = resolve_profile(alias).upstream
@@ -384,6 +488,7 @@ async def test_model_not_found_switches_once_without_retry_budget_or_auto_ban(en
     first, _ = await env.add("first", [NEW_CLAUDE])
     await env.add("second", [NEW_CLAUDE])
     config._config_cache["credential_select_mode"] = mode
+    config._config_cache["auto_ban_error_codes"] = [404]
     body = request_body()
     manager._sticky_email = first
     await session_cache.set_session_binding(api._derive_session_key(NEW_CLAUDE, body), first)
@@ -396,7 +501,7 @@ async def test_model_not_found_switches_once_without_retry_budget_or_auto_ban(en
         return await original(model_name, excluded_emails)
 
     env.db.get_next_available_credential = first_then_random
-    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     result = await call_api(stream, body)
     assert isinstance(result, list) if stream else result.status_code == 200
     assert [token for token, _ in env.upstream.generated] == ["first", "second"]
@@ -407,6 +512,7 @@ async def test_model_not_found_switches_once_without_retry_budget_or_auto_ban(en
     assert first not in manager._model_cache
     assert (await env.db.get_credential_state(first))["disabled"] is False
     assert api.record_api_call_error.await_count == 1
+    assert json.loads(api.record_api_call_error.await_args.kwargs["error_message"]) == NOT_FOUND_ERROR
     assert api.record_usage_log.await_count == 2
 
 
@@ -415,9 +521,9 @@ async def test_all_model_mismatches_stop_after_each_credential_once(env, stream)
     for index in range(5):
         label = f"token-{index}"
         await env.add(label, [NEW_CLAUDE])
-        env.upstream.outcomes[label] = [(400, "Requested model not found.")]
+        env.upstream.outcomes[label] = [(404, NOT_FOUND_ERROR)]
     result = await call_api(stream)
-    assert result.status_code == 400
+    assert result.status_code == 404
     tokens = [token for token, _ in env.upstream.generated]
     assert len(tokens) == len(set(tokens)) == 5
 
@@ -435,7 +541,7 @@ async def test_repeated_requests_skip_a_model_rejected_by_a_credential(
     ))
     config._config_cache["credential_select_mode"] = mode
     body = request_body()
-    env.upstream.outcomes["first"] = [(400, "Requested model not found.")] * 2
+    env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)] * 2
 
     for _ in range(2):
         manager._sticky_email = first
@@ -457,8 +563,8 @@ async def test_model_mismatch_stays_disabled_after_cache_expiry(env, monkeypatch
         random=lambda: storage.AntigravityCredential.id
     ))
     now = [0.0]
-    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0]))
-    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
+    env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(stream)
     assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
     for now[0] in (301, 86400, 86400 * 365):
@@ -472,7 +578,7 @@ async def test_model_mismatch_stays_disabled_after_configuration_changes(env, mo
     monkeypatch.setattr(storage, "func", SimpleNamespace(
         random=lambda: storage.AntigravityCredential.id
     ))
-    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(False)
     assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
 
@@ -491,7 +597,7 @@ async def test_rediscovery_and_model_lists_keep_rejected_models_excluded(env, mo
     monkeypatch.setattr(storage, "func", SimpleNamespace(
         random=lambda: storage.AntigravityCredential.id
     ))
-    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(False)
     await env.db.update_credential_state(second, {"disabled": True})
     # 上游列表仍包含被拒绝的模型，重新查询也不能恢复它。
@@ -533,7 +639,7 @@ async def test_model_disable_survives_database_and_process_restart(env, monkeypa
     ))
     config._config_cache["credential_select_mode"] = mode
     body = request_body()
-    env.upstream.outcomes["first"] = [(400, "Requested model not found.")]
+    env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(stream, body)
     await env.db.close()
     manager._model_cache.clear()
@@ -592,9 +698,11 @@ async def test_model_disable_table_upgrade_preserves_existing_data(env):
     await env.db.insert_usage_log({"credential_email": email, "status_code": 403})
     before_data = await env.db.get_credential(email)
     before_state = await env.db.get_credential_state(email)
-    # 模拟已经有凭证、配置和日志，但尚无模型禁用表的原版数据库。
+    # 模拟已有凭证、配置和日志，但尚无 Paid 字段及模型禁用表的原版数据库。
     async with env.db._engine.begin() as connection:
         await connection.run_sync(storage.DisabledCredentialModel.__table__.drop)
+        await connection.execute(storage.text("ALTER TABLE antigravity_credentials DROP COLUMN paid"))
+        await connection.execute(storage.text("ALTER TABLE antigravity_credentials DROP COLUMN paid_checked_at"))
     await env.db.close()
     await env.db.initialize()
     assert await env.db.get_credential(email) == before_data
@@ -619,9 +727,14 @@ async def test_permanently_disabled_model_does_not_refresh_an_expired_token(env,
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_ordinary_400_keeps_existing_error_handling(env, stream):
+@pytest.mark.parametrize("message", [
+    "Invalid thought_signature for model.",
+    "Requested model not found.",
+    "Function call not found for requested model.",
+])
+async def test_ordinary_400_keeps_existing_error_handling(env, stream, message):
     email, _ = await env.add("token", [NEW_CLAUDE])
-    env.upstream.outcomes["token"] = [(400, "Invalid thought_signature for model.")]
+    env.upstream.outcomes["token"] = [(400, message)]
     result = await call_api(stream)
     assert result.status_code == 400
     assert len(env.upstream.generated) == 1
@@ -644,25 +757,3 @@ async def test_existing_service_error_retry_budget_remains_bounded(env, stream, 
     else:
         assert result.status_code == 503
     assert len(env.upstream.generated) == 3
-
-
-@pytest.mark.parametrize("message", [
-    "Requested model not found.",
-    "Model 'claude-opus-5-5-high' does not exist.",
-    "Model gemini-4-argon-high is not available.",
-])
-def test_detects_explicit_model_unavailable(message):
-    assert api._is_model_not_found_error(400, json.dumps({"error": {"message": message}}))
-
-
-@pytest.mark.parametrize("body", [
-    json.dumps({"error": {"message": "Invalid thought_signature for model."}}),
-    json.dumps({"error": {"message": "Model 'claude' does not support function calling."}}),
-    json.dumps({"error": {"message": "Function call not found for requested model."}}),
-    json.dumps({"error": "Requested model not found."}),
-    "not JSON",
-    "[]",
-])
-def test_other_400_errors_are_not_model_mismatches(body):
-    assert not api._is_model_not_found_error(400, body)
-    assert not api._is_model_not_found_error(503, body)
