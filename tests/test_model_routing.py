@@ -173,10 +173,8 @@ async def test_search_continues_past_three_ineligible_credentials(env, monkeypat
     for index in range(8):
         await env.add(f"free-{index}", [OLD_CLAUDE, FLASH])
     paid, _ = await env.add("paid", [NEW_CLAUDE])
-    # 固定随机查询顺序，确保真正走过八个不匹配的候选和数据库排除过滤。
-    monkeypatch.setattr(storage, "func", SimpleNamespace(
-        random=lambda: storage.AntigravityCredential.id
-    ))
+    # 固定候选选择顺序，确保真正走过八个不匹配的候选和数据库排除过滤。
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     result = await manager.get_valid_credential(NEW_CLAUDE)
     assert result[0] == paid
     assert len(env.upstream.probes) == 9
@@ -193,6 +191,25 @@ async def test_disabled_and_cooling_credentials_remain_excluded(env):
     await env.db.set_model_cooldown(cooling, NEW_CLAUDE, time.time() + 3600)
     assert (await manager.get_valid_credential(NEW_CLAUDE))[0] == available
     assert [probe[1] for probe in env.upstream.probes] == ["available"]
+
+
+@pytest.mark.parametrize("model", [None, NEW_CLAUDE])
+async def test_pool_selection_excludes_candidates_before_random_choice(env, monkeypatch, model):
+    excluded, _ = await env.add("excluded", [NEW_CLAUDE])
+    disabled, _ = await env.add("disabled", [NEW_CLAUDE])
+    cooling, _ = await env.add("cooling", [NEW_CLAUDE])
+    available, _ = await env.add("available", [NEW_CLAUDE])
+    await env.db.update_credential_state(disabled, {"disabled": True})
+    await env.db.set_model_cooldown(cooling, NEW_CLAUDE, time.time() + 3600)
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+
+    result = await env.db.get_next_available_credential(model, excluded_emails={excluded})
+    assert result[0] == (cooling if model is None else available)
+    assert result[1]["access_token"] == ("cooling" if model is None else "available")
+    assert await env.db.get_next_available_credential(
+        model, excluded_emails={excluded, cooling, available}
+    ) is None
+    assert not env.upstream.probes and not env.upstream.generated
 
 
 async def test_model_lists_are_union_cached_and_preserve_aliases(env):
@@ -536,9 +553,7 @@ async def test_repeated_requests_skip_a_model_rejected_by_a_credential(
 ):
     first, _ = await env.add("first", None if discovery_fails else [NEW_CLAUDE, FLASH])
     await env.add("second", [NEW_CLAUDE])
-    monkeypatch.setattr(storage, "func", SimpleNamespace(
-        random=lambda: storage.AntigravityCredential.id
-    ))
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     config._config_cache["credential_select_mode"] = mode
     body = request_body()
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)] * 2
@@ -559,9 +574,7 @@ async def test_repeated_requests_skip_a_model_rejected_by_a_credential(
 async def test_model_mismatch_stays_disabled_after_cache_expiry(env, monkeypatch, stream):
     first, _ = await env.add("first", [NEW_CLAUDE])
     await env.add("second", [NEW_CLAUDE])
-    monkeypatch.setattr(storage, "func", SimpleNamespace(
-        random=lambda: storage.AntigravityCredential.id
-    ))
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     now = [0.0]
     monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
@@ -575,9 +588,7 @@ async def test_model_mismatch_stays_disabled_after_cache_expiry(env, monkeypatch
 async def test_model_mismatch_stays_disabled_after_configuration_changes(env, monkeypatch, field):
     first, data = await env.add("first", [NEW_CLAUDE])
     await env.add("second", [NEW_CLAUDE])
-    monkeypatch.setattr(storage, "func", SimpleNamespace(
-        random=lambda: storage.AntigravityCredential.id
-    ))
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(False)
     assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
@@ -594,9 +605,7 @@ async def test_model_mismatch_stays_disabled_after_configuration_changes(env, mo
 async def test_rediscovery_and_model_lists_keep_rejected_models_excluded(env, monkeypatch):
     first, data = await env.add("first", [NEW_CLAUDE, FLASH])
     second, _ = await env.add("second", [NEW_CLAUDE])
-    monkeypatch.setattr(storage, "func", SimpleNamespace(
-        random=lambda: storage.AntigravityCredential.id
-    ))
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(False)
     await env.db.update_credential_state(second, {"disabled": True})
@@ -634,9 +643,7 @@ async def test_inflight_discovery_cannot_restore_a_rejected_model(env, monkeypat
 async def test_model_disable_survives_database_and_process_restart(env, monkeypatch, stream, mode):
     first, _ = await env.add("first", [NEW_CLAUDE, FLASH])
     await env.add("second", [NEW_CLAUDE])
-    monkeypatch.setattr(storage, "func", SimpleNamespace(
-        random=lambda: storage.AntigravityCredential.id
-    ))
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     config._config_cache["credential_select_mode"] = mode
     body = request_body()
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
@@ -757,3 +764,40 @@ async def test_existing_service_error_retry_budget_remains_bounded(env, stream, 
     else:
         assert result.status_code == 503
     assert len(env.upstream.generated) == 3
+
+
+async def test_export_import_reuses_token_and_preserves_paid_and_model_disables(env, monkeypatch):
+    email, data = await env.add("token", [NEW_CLAUDE, GEMINI4, FLASH])
+    await manager.get_credential_model_ids(email, data)
+    await env.db.disable_credential_model(email, NEW_CLAUDE)
+    before_state = await env.db.get_credential_state(email)
+    refresh = AsyncMock(side_effect=AssertionError("未过期的导入 access_token 应直接复用"))
+    monkeypatch.setattr(panel.Credentials, "refresh", refresh)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test"
+    ) as client:
+        response = await client.get(f"/creds/export/{email}")
+    assert response.status_code == 200
+    exported = response.json()
+    assert exported == {
+        "email": email,
+        "refresh_token": data["refresh_token"],
+        "access_token": data["access_token"],
+        "expiry": data["expiry"],
+        "tier": data["tier"],
+        "project_id": data["project_id"],
+    }
+
+    result = await panel._import_single_credential(exported)
+    assert result["status"] == "success"
+    refresh.assert_not_awaited()
+    assert email not in manager._model_cache
+    stored = await env.db.get_credential(email)
+    assert stored["access_token"] == data["access_token"]
+    assert stored["expiry"] == data["expiry"]
+    after_state = await env.db.get_credential_state(email)
+    assert after_state["paid"] is before_state["paid"] is True
+    assert after_state["paid_checked_at"] == before_state["paid_checked_at"]
+    assert await env.db.get_disabled_model_ids(email) == {NEW_CLAUDE}
+    assert len(env.upstream.probes) == 1 and not env.upstream.generated
