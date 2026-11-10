@@ -74,6 +74,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
 
         # 凭证选择模式
         current_config["credential_select_mode"] = await config.get_credential_select_mode()
+        current_config["free_account_priority_enabled"] = await config.get_free_account_priority_enabled()
 
         # 服务器配置
         current_config["host"] = await config.get_server_host()
@@ -244,6 +245,10 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             mode = new_config["credential_select_mode"]
             if mode not in ("random", "cache", "sticky"):
                 raise HTTPException(status_code=400, detail="凭证选择模式必须是 random / cache / sticky")
+
+        if "free_account_priority_enabled" in new_config:
+            if not isinstance(new_config["free_account_priority_enabled"], bool):
+                raise HTTPException(status_code=400, detail="免费账户优先开关必须是布尔值")
 
         # 验证服务器配置
         if "host" in new_config:

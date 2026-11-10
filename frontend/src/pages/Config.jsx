@@ -142,6 +142,12 @@ const CONFIG_GROUPS = [
     title: "凭证选择模式",
     fields: [
       {
+        key: "free_account_priority_enabled",
+        label: "免费账户优先",
+        type: "bool",
+        note: "默认开启。Non-paid 账户支持的模型优先使用这些账户；没有可用免费账户时回退其他账户。按模型能力识别，与 Tier 无关；会话缓存和粘性在同一优先级内保持。",
+      },
+      {
         key: "credential_select_mode",
         label: "选择模式",
         type: "select",
@@ -294,13 +300,19 @@ export default function Config() {
         <label className="flex items-center gap-3 cursor-pointer select-none">
           <button
             type="button"
+            role="switch"
+            aria-label={field.label}
+            aria-checked={!!value}
             onClick={() => setField(field.key, !value)}
-            className={`relative w-11 h-6 rounded-full transition-colors ${
-              value ? "bg-purple-600" : "bg-dark-600"
-            }`}
+            className="relative w-11 h-10 rounded-lg shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
           >
             <span
-              className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${
+              aria-hidden="true"
+              className={`absolute inset-x-0 top-2 h-6 rounded-full transition-colors motion-reduce:transition-none ${value ? "bg-purple-600" : "bg-dark-600"}`}
+            />
+            <span
+              aria-hidden="true"
+              className={`absolute top-2.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform motion-reduce:transition-none ${
                 value ? "translate-x-5" : ""
               }`}
             />

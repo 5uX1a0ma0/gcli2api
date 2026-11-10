@@ -407,7 +407,8 @@ class Database:
             return False
 
     async def get_next_available_credential(
-        self, model_name: Optional[str] = None, excluded_emails: Optional[set[str]] = None
+        self, model_name: Optional[str] = None, excluded_emails: Optional[set[str]] = None,
+        exclude_paid: bool = False,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """随机获取一个可用凭证（负载均衡 + 模型家族级冷却过滤），返回 (email, credential)"""
         current_time = time.time()
@@ -415,16 +416,15 @@ class Database:
         async with self.session() as s:
             # 轻量查询：只取必要的小字段（email/冷却/禁用），避免全表加载
             # access_token/refresh_token 等大字段（凭证明文可达数 KB）
-            rows = (
-                await s.execute(
-                    select(
-                        AntigravityCredential.email,
-                        AntigravityCredential.model_cooldowns,
-                    )
-                    .where(AntigravityCredential.disabled == False)  # noqa: E712
-                    .order_by(AntigravityCredential.id)
-                )
-            ).all()
+            query = select(
+                AntigravityCredential.email,
+                AntigravityCredential.model_cooldowns,
+                AntigravityCredential.paid,
+            ).where(AntigravityCredential.disabled == False)  # noqa: E712
+            if exclude_paid:
+                # 未识别的凭证也参与探测，冷启动时即可发现可用免费账户。
+                query = query.where(AntigravityCredential.paid.is_not(True))
+            rows = (await s.execute(query.order_by(AntigravityCredential.id))).all()
             if excluded_emails:
                 rows = [row for row in rows if row.email not in excluded_emails]
             if not rows:
@@ -433,14 +433,18 @@ class Database:
             candidates = rows
             if cd_group:
                 candidates = []
-                for email, model_cooldowns in rows:
-                    cooldowns = _load_json(model_cooldowns, {})
+                for candidate in rows:
+                    cooldowns = _load_json(candidate.model_cooldowns, {})
                     cd = cooldowns.get(cd_group)
                     if cd is not None and current_time < cd:
                         continue
-                    candidates.append((email, model_cooldowns))
+                    candidates.append(candidate)
             if not candidates:
                 return None
+            if exclude_paid:
+                known_free = [candidate for candidate in candidates if candidate.paid is False]
+                if known_free:
+                    candidates = known_free
             picked_email = random.choice(candidates)[0]
             # 只取被选中凭证的完整数据
             row = await s.scalar(
@@ -453,7 +457,7 @@ class Database:
             return row.email, _row_to_credential_dict(row)
 
     async def get_available_credential_by_email(
-        self, email: str, model_name: Optional[str] = None
+        self, email: str, model_name: Optional[str] = None, exclude_paid: bool = False,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
         按指定 email 获取可用凭证（凭证亲和/粘性模式使用）。
@@ -468,6 +472,8 @@ class Database:
                 select(AntigravityCredential).where(AntigravityCredential.email == email)
             )
             if not row or row.disabled:
+                return None
+            if exclude_paid and row.paid is True:
                 return None
             if cd_group:
                 cooldowns = _load_json(row.model_cooldowns, {})

@@ -52,7 +52,8 @@ async def handle_error_with_retry(
     1. 429错误(速率限制)
     2. 503错误(服务不可用)
     3. 500错误(服务临时不可用)
-    4. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)
+    4. 400/403错误（请求或凭证被上游拒绝）
+    5. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)
 
     Returns:
         bool: True表示需要继续重试，False表示不需要重试
@@ -71,8 +72,8 @@ async def handle_error_with_retry(
             return True
         return False
 
-    # 如果不触发自动封禁，仅对429、503和500错误进行重试
-    if status_code in (429, 500, 503) and retry_enabled and attempt < max_retries:
+    # 重试与自动封禁独立：400/403 即使未配置自动封禁也可重试。
+    if status_code in (400, 403, 429, 500, 503) and retry_enabled and attempt < max_retries:
         log.info(
             f"[RETRY] {status_code} error encountered, retrying "
             f"(attempt {attempt + 1}/{max_retries})"

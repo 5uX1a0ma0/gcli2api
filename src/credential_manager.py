@@ -13,7 +13,11 @@ from typing import Any, Dict, Optional, Tuple
 
 from log import log
 
-from config import get_antigravity_api_url, get_credential_select_mode
+from config import (
+    get_antigravity_api_url,
+    get_credential_select_mode,
+    get_free_account_priority_enabled,
+)
 from src import session_cache
 from src.google_oauth_api import Credentials
 from src.storage.database import get_database
@@ -157,6 +161,22 @@ async def get_valid_credential(
     mode = await get_credential_select_mode()
     excluded = set(excluded_emails or ())
 
+    # 免费优先在亲和选取之前生效；已知 Paid 专属模型直接走常规能力分流。
+    if (
+        model_name
+        and await get_free_account_priority_enabled()
+        and get_model_paid_status(frozenset({model_name})) is not True
+    ):
+        preferred_email = _sticky_email if mode == "sticky" else None
+        if mode == "cache" and session_key:
+            preferred_email = await session_cache.get_session_binding(session_key)
+        preferred = await _get_non_paid_credential(
+            database, model_name, excluded, preferred_email
+        )
+        if preferred:
+            await _after_picked(mode, preferred[0], session_key)
+            return preferred
+
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:
         bound_email = await session_cache.get_session_binding(session_key)
@@ -214,6 +234,41 @@ async def get_valid_credential(
 
         await _after_picked(mode, email, session_key)
         return final
+
+
+async def _get_non_paid_credential(
+    database, model_name: str, excluded: set[str], preferred_email: Optional[str]
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """保留免费池内的凭证亲和；探测未知能力后仅优先确认支持模型的 Non-paid。"""
+    checked = set(excluded)
+    while True:
+        if preferred_email and preferred_email not in checked:
+            checked.add(preferred_email)
+            result = await database.get_available_credential_by_email(
+                preferred_email, model_name=model_name, exclude_paid=True
+            )
+            preferred_email = None
+            if result is None:
+                continue
+        else:
+            result = await database.get_next_available_credential(
+                model_name=model_name, excluded_emails=checked, exclude_paid=True
+            )
+            if result is None:
+                return None
+            checked.add(result[0])
+
+        final = await _validate_or_refresh(*result, model_name=model_name)
+        if final is None:
+            excluded.add(result[0])
+            continue
+        model_ids = await get_credential_model_ids(*final)
+        if model_ids is None or model_name not in model_ids:
+            continue
+        state = await database.get_credential_state(final[0])
+        if state.get("paid") is False:
+            return final
+        # 已确认付费或暂时未知的候选仍能参与后面的回退，不加入 excluded。
 
 
 async def _validate_or_refresh(

@@ -6,24 +6,19 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from fastapi import FastAPI, Response
 
 import config
+from src.api import antigravity as api
 from src import credential_manager as manager, session_cache
+from src.converter.antigravity_fix import resolve_profile
+from src.panel import config_routes as config_panel, creds as panel
+from src.router.antigravity.model_list import get_antigravity_models_with_features
 from src.storage import database as storage
-
-# src.utils 导入时会查询 CLI 版本；测试只使用固定版本，禁止外部网络请求。
-with patch("httpx.get", return_value=httpx.Response(
-    200, json={"tag_name": "v1.4.12"}, request=httpx.Request("GET", "https://github.test")
-)):
-    from src.api import antigravity as api
-    from src.converter.antigravity_fix import resolve_profile
-    from src.panel import creds as panel
-    from src.router.antigravity.model_list import get_antigravity_models_with_features
 
 
 FLASH = "gemini-3.8-flash"
@@ -89,6 +84,7 @@ async def env(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "_config_cache", {
         "antigravity_api_url": "https://antigravity.test",
         "credential_select_mode": "random",
+        "free_account_priority_enabled": False,
         "retry_429_enabled": False,
         "retry_429_max_retries": 0,
         "retry_429_interval": 0,
@@ -739,7 +735,7 @@ async def test_permanently_disabled_model_does_not_refresh_an_expired_token(env,
     "Requested model not found.",
     "Function call not found for requested model.",
 ])
-async def test_ordinary_400_keeps_existing_error_handling(env, stream, message):
+async def test_400_returns_original_error_when_retry_is_disabled(env, stream, message):
     email, _ = await env.add("token", [NEW_CLAUDE])
     env.upstream.outcomes["token"] = [(400, message)]
     result = await call_api(stream)
@@ -801,3 +797,241 @@ async def test_export_import_reuses_token_and_preserves_paid_and_model_disables(
     assert after_state["paid_checked_at"] == before_state["paid_checked_at"]
     assert await env.db.get_disabled_model_ids(email) == {NEW_CLAUDE}
     assert len(env.upstream.probes) == 1 and not env.upstream.generated
+
+
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", [FLASH, OLD_CLAUDE])
+async def test_free_priority_overrides_paid_affinity_and_discovers_unknown_accounts(
+    env, monkeypatch, mode, stream, model
+):
+    paid, _ = await env.add("paid", [NEW_CLAUDE, FLASH, OLD_CLAUDE], tier="free")
+    free, _ = await env.add("free", [OLD_CLAUDE, FLASH], tier="ultra")
+    config._config_cache.update({"credential_select_mode": mode, "free_account_priority_enabled": True})
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    body = request_body(model)
+    key = api._derive_session_key(model, body)
+    manager._sticky_email = paid
+    await session_cache.set_session_binding(key, paid)
+
+    for _ in range(2):
+        result = await call_api(stream, body)
+        assert isinstance(result, list) if stream else result.status_code == 200
+    assert [token for token, _ in env.upstream.generated] == ["free", "free"]
+    assert (await env.db.get_credential_state(free))["paid"] is False
+    if mode == "cache":
+        assert await session_cache.get_session_binding(key) == free
+    elif mode == "sticky":
+        assert manager._sticky_email == free
+
+
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+async def test_disabling_free_priority_restores_existing_selection(env, monkeypatch, mode):
+    paid, _ = await env.add("paid", [NEW_CLAUDE, FLASH])
+    free, _ = await env.add("free", [OLD_CLAUDE, FLASH])
+    config._config_cache["credential_select_mode"] = mode
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    manager._sticky_email = paid
+    await session_cache.set_session_binding("session", paid)
+    assert (await manager.get_valid_credential(FLASH, "session"))[0] == paid
+    config._config_cache["free_account_priority_enabled"] = True
+    assert (await manager.get_valid_credential(FLASH, "session"))[0] == free
+
+
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+@pytest.mark.parametrize("reason", ["disabled", "cooldown", "unsupported", "rejected", "expired", "unknown"])
+async def test_free_priority_falls_back_when_free_account_is_unavailable(env, monkeypatch, mode, reason):
+    paid, paid_data = await env.add("paid", [NEW_CLAUDE, FLASH])
+    free, data = await env.add("free", [OLD_CLAUDE] if reason == "unsupported" else [OLD_CLAUDE, FLASH])
+    await manager.get_credential_model_ids(paid, paid_data)
+    await manager.get_credential_model_ids(free, data)
+    if reason == "disabled":
+        await env.db.update_credential_state(free, {"disabled": True})
+    elif reason == "cooldown":
+        await env.db.set_model_cooldown(free, FLASH, time.time() + 3600)
+    elif reason == "rejected":
+        await manager.mark_credential_model_unavailable(free, FLASH)
+    elif reason == "expired":
+        data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await env.db.store_credential(free, data)
+        monkeypatch.setattr(manager, "refresh_token", AsyncMock(return_value=None))
+    elif reason == "unknown":
+        env.upstream.models["free"] = None
+        manager.invalidate_model_cache(free)
+    config._config_cache.update({"credential_select_mode": mode, "free_account_priority_enabled": True})
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    manager._sticky_email = paid
+    await session_cache.set_session_binding("session", paid)
+    assert (await manager.get_valid_credential(FLASH, "session"))[0] == paid
+
+
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+async def test_free_priority_preserves_free_pool_affinity_and_exclusions(env, monkeypatch, mode):
+    paid, paid_data = await env.add("paid", [NEW_CLAUDE, FLASH])
+    first, first_data = await env.add("first-free", [OLD_CLAUDE, FLASH])
+    second, second_data = await env.add("second-free", [OLD_CLAUDE, FLASH])
+    for email, data in ((paid, paid_data), (first, first_data), (second, second_data)):
+        await manager.get_credential_model_ids(email, data)
+    config._config_cache.update({"credential_select_mode": mode, "free_account_priority_enabled": True})
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[-1])
+    manager._sticky_email = second
+    await session_cache.set_session_binding("session", second)
+    assert (await manager.get_valid_credential(FLASH, "session"))[0] == second
+    excluded = {second}
+    assert (await manager.get_valid_credential(FLASH, "session", excluded))[0] == first
+    assert excluded == {second}
+
+
+async def test_free_priority_uses_known_free_accounts_before_probing_unknown_accounts(env, monkeypatch):
+    await env.add("unknown", [NEW_CLAUDE, FLASH])
+    free, data = await env.add("known-free", [OLD_CLAUDE, FLASH])
+    await manager.get_credential_model_ids(free, data)
+    config._config_cache["free_account_priority_enabled"] = True
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    assert (await manager.get_valid_credential(FLASH))[0] == free
+    assert [probe[1] for probe in env.upstream.probes] == ["known-free"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_free_priority_keeps_404_model_bans_and_paid_fallback(env, monkeypatch, stream):
+    await env.add("paid", [NEW_CLAUDE, FLASH])
+    free, _ = await env.add("free", [OLD_CLAUDE, FLASH])
+    config._config_cache["free_account_priority_enabled"] = True
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    env.upstream.outcomes["free"] = [(404, NOT_FOUND_ERROR)]
+    for _ in range(2):
+        result = await call_api(stream, request_body(FLASH))
+        assert isinstance(result, list) if stream else result.status_code == 200
+    assert [token for token, _ in env.upstream.generated] == ["free", "paid", "paid"]
+    assert await env.db.get_disabled_model_ids(free) == {FLASH}
+    assert (await env.db.get_credential_state(free))["disabled"] is False
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("1", True), ("false", False), ("0", False)])
+async def test_free_priority_environment_overrides_saved_setting(env, monkeypatch, value, expected):
+    config._config_cache["free_account_priority_enabled"] = not expected
+    monkeypatch.setenv("FREE_ACCOUNT_PRIORITY_ENABLED", value)
+    assert await config.get_free_account_priority_enabled() is expected
+
+
+async def test_free_priority_config_defaults_on_and_persists_panel_changes(env, monkeypatch):
+    config._config_cache.pop("free_account_priority_enabled")
+    monkeypatch.setattr(config_panel, "get_database", AsyncMock(return_value=env.db))
+    monkeypatch.setattr(storage, "get_database", AsyncMock(return_value=env.db))
+    app = panel_app()
+    app.include_router(config_panel.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://panel.test") as client:
+        assert (await client.get("/config/get")).json()["config"]["free_account_priority_enabled"] is True
+        response = await client.post("/config/save", json={"config": {"free_account_priority_enabled": False}})
+        assert response.status_code == 200
+        assert await env.db.get_config("free_account_priority_enabled") is False
+        assert await config.get_free_account_priority_enabled() is False
+        for value in ("false", 0, None):
+            assert (await client.post("/config/save", json={"config": {"free_account_priority_enabled": value}})).status_code == 400
+        monkeypatch.setenv("FREE_ACCOUNT_PRIORITY_ENABLED", "true")
+        response = await client.post("/config/save", json={"config": {"free_account_priority_enabled": False}})
+        assert response.json()["saved_config"] == {}
+        current = (await client.get("/config/get")).json()
+        assert current["config"]["free_account_priority_enabled"] is True
+        assert "free_account_priority_enabled" in current["env_locked"]
+
+
+async def test_original_project_verification_preserves_paid_and_permanent_model_bans(env, monkeypatch):
+    email, data = await env.add("free", [OLD_CLAUDE, FLASH])
+    await manager.get_credential_model_ids(email, data)
+    before = await env.db.get_credential_state(email)
+    await env.db.update_credential_state(email, {"disabled": True, "error_codes": [403]})
+    await env.db.disable_credential_model(email, FLASH)
+    monkeypatch.setattr(panel.Credentials, "refresh_if_needed", AsyncMock(return_value=False))
+    monkeypatch.setattr(panel, "fetch_project_id_and_tier", AsyncMock(return_value=("verified-project", "ultra")))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=panel_app()), base_url="http://panel.test") as client:
+        response = await client.post(f"/creds/verify-project/{email}")
+    assert response.status_code == 200 and response.json()["success"] is True
+    after = await env.db.get_credential_state(email)
+    assert after["disabled"] is False and after["error_codes"] == []
+    assert after["project_id"] == "verified-project" and after["tier"] == "ultra"
+    assert after["paid"] is before["paid"] is False
+    assert after["paid_checked_at"] == before["paid_checked_at"]
+    assert await env.db.get_disabled_model_ids(email) == {FLASH}
+    assert not env.upstream.generated
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("mode", ["random", "cache", "sticky"])
+@pytest.mark.parametrize("status", [400, 403])
+async def test_rejected_request_retries_with_another_credential_without_auto_ban(
+    env, monkeypatch, stream, mode, status
+):
+    first, _ = await env.add("first", [NEW_CLAUDE])
+    await env.add("second", [NEW_CLAUDE])
+    config._config_cache.update({
+        "credential_select_mode": mode, "retry_429_enabled": True,
+        "retry_429_max_retries": 2, "auto_ban_enabled": False,
+    })
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    body = request_body()
+    manager._sticky_email = first
+    await session_cache.set_session_binding(api._derive_session_key(NEW_CLAUDE, body), first)
+    env.upstream.outcomes["first"] = [(status, "Request rejected by upstream")]
+    result = await call_api(stream, body)
+    assert isinstance(result, list) if stream else result.status_code == 200
+    assert [token for token, _ in env.upstream.generated] == ["first", "second"]
+    assert [payload["project"] for _, payload in env.upstream.generated] == ["project-first", "project-second"]
+    assert (await env.db.get_credential_state(first))["disabled"] is False
+    assert await env.db.get_disabled_model_ids(first) == set()
+    assert api.record_usage_log.await_count == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("succeed", [False, True])
+async def test_400_retry_is_bounded_and_can_reuse_the_only_available_credential(env, stream, succeed):
+    email, _ = await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 2,
+        "auto_ban_error_codes": [403],
+    })
+    env.upstream.outcomes["token"] = [(400, "bad request")] * 2 + [
+        (200, "ok") if succeed else (400, "final error"),
+    ]
+    result = await call_api(stream)
+    if succeed:
+        assert isinstance(result, list) if stream else result.status_code == 200
+    else:
+        assert result.status_code == 400
+        assert json.loads(result.body)["error"]["message"] == "final error"
+    assert len(env.upstream.generated) == 3
+    assert api.record_usage_log.await_count == 3
+    assert (await env.db.get_credential_state(email))["disabled"] is False
+    assert await env.db.get_disabled_model_ids(email) == set()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [400, 403])
+async def test_rejected_request_keeps_configured_auto_ban_and_original_error(env, stream, status):
+    email, _ = await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 2,
+        "auto_ban_enabled": True, "auto_ban_error_codes": [status],
+    })
+    env.upstream.outcomes["token"] = [(status, "credential rejected")]
+    result = await call_api(stream)
+    assert result.status_code == status
+    assert (await env.db.get_credential_state(email))["disabled"] is True
+    assert len(env.upstream.generated) == 1
+    assert await env.db.get_disabled_model_ids(email) == set()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_400_retry_can_fall_back_from_free_to_paid_credentials(env, monkeypatch, stream):
+    await env.add("paid", [NEW_CLAUDE, FLASH])
+    free, _ = await env.add("free", [OLD_CLAUDE, FLASH])
+    config._config_cache.update({
+        "free_account_priority_enabled": True, "retry_429_enabled": True,
+        "retry_429_max_retries": 1, "auto_ban_error_codes": [403],
+    })
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    env.upstream.outcomes["free"] = [(400, "invalid thought signature")]
+    result = await call_api(stream, request_body(FLASH))
+    assert isinstance(result, list) if stream else result.status_code == 200
+    assert [token for token, _ in env.upstream.generated] == ["free", "paid"]
+    assert await env.db.get_disabled_model_ids(free) == set()

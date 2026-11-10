@@ -199,7 +199,7 @@ def build_antigravity_headers(
 
 def _is_retryable_status(status_code: int, disable_error_codes: List[int]) -> bool:
     """统一判断是否属于可重试状态码。"""
-    return status_code in (429, 503) or status_code in disable_error_codes
+    return status_code in (400, 403, 429, 503) or status_code in disable_error_codes
 
 
 def _is_model_not_found_error(status_code: int) -> bool:
@@ -232,6 +232,23 @@ async def _switch_credential_for_retry(
         return True, next_cred_task
 
     return False, next_cred_task
+
+
+async def _select_retry_credential(
+    model_name: str, session_key: Optional[str], excluded_emails: set[str],
+    failed_email: Optional[str] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """400/403 优先换凭证，无替代时有限重试当前凭证；永久禁用仍由选取层过滤。"""
+    if failed_email:
+        replacement = await get_valid_credential(
+            model_name=model_name, session_key=session_key,
+            excluded_emails=excluded_emails | {failed_email},
+        )
+        if replacement:
+            return replacement
+    return await get_valid_credential(
+        model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
+    )
 
 
 # ==================== 新的流式和非流式请求函数 ====================
@@ -394,12 +411,13 @@ async def stream_request(
     last_error_response = None  # 记录最后一次的错误响应
     last_error_body = ""  # 详细日志：最后一次的错误响应体
     next_cred_task = None  # 预热的下一个凭证任务
+    retry_failed_email: Optional[str] = None
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast():
         nonlocal current_file, access_token, auth_headers, project_id, final_payload
-        cred_result = await get_valid_credential(
-            model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
+        cred_result = await _select_retry_credential(
+            model_name, session_key, excluded_emails, retry_failed_email
         )
         if not cred_result:
             return None
@@ -428,6 +446,7 @@ async def stream_request(
 
     attempt = 0
     while attempt <= max_retries:
+        retry_failed_email = None
         success_recorded = False  # 标记是否已记录成功
         need_retry = False  # 标记是否需要重试
         model_not_found = False
@@ -494,8 +513,9 @@ async def stream_request(
                         model_not_found = need_retry = True
                         break
 
-                    # 如果错误码是429、503或者在禁用码当中，做好记录后进行重试
+                    # 拒绝、限流或配置的自动禁用错误统一走重试流程。
                     if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
+                        retry_failed_email = current_file if status_code in (400, 403) else None
                         log.warning(f"[ANTIGRAVITY STREAM] 流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_body[:500] if error_body else '无'}")
 
                         # 解析冷却时间
@@ -507,11 +527,10 @@ async def stream_request(
                                 pass
 
                         # 预热下一个凭证
-                        if next_cred_task is None and attempt < max_retries:
+                        if next_cred_task is None and retry_config["retry_enabled"] and attempt < max_retries:
                             next_cred_task = asyncio.create_task(
-                                get_valid_credential(
-                                    model_name=model_name, session_key=session_key,
-                                    excluded_emails=excluded_emails,
+                                _select_retry_credential(
+                                    model_name, session_key, excluded_emails, retry_failed_email,
                                 )
                             )
 
@@ -606,7 +625,7 @@ async def stream_request(
                 if not switched:
                     # 换凭证失败，本次未调用谷歌 API，不产生日志
                     log.error("[ANTIGRAVITY STREAM] 重试时无可用凭证或令牌")
-                    yield Response(
+                    yield last_error_response or Response(
                         content=json.dumps({"error": "当前无可用凭证"}),
                         status_code=500,
                         media_type="application/json"
@@ -775,12 +794,13 @@ async def non_stream_request(
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
     next_cred_task = None  # 预热的下一个凭证任务
+    retry_failed_email: Optional[str] = None
 
     # 内部函数：快速更新凭证(只更新token和project_id,避免重建整个请求)
     async def refresh_credential_fast():
         nonlocal current_file, access_token, auth_headers, project_id, final_payload
-        cred_result = await get_valid_credential(
-            model_name=model_name, session_key=session_key, excluded_emails=excluded_emails
+        cred_result = await _select_retry_credential(
+            model_name, session_key, excluded_emails, retry_failed_email
         )
         if not cred_result:
             return None
@@ -809,6 +829,7 @@ async def non_stream_request(
 
     attempt = 0
     while attempt <= max_retries:
+        retry_failed_email = None
         need_retry = False  # 标记是否需要重试
         attempt_start_time = time.time()  # 本次上游调用开始时间
         
@@ -883,6 +904,7 @@ async def non_stream_request(
                     return last_error_response
 
                 if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
+                    retry_failed_email = current_file if status_code in (400, 403) else None
                     log.warning(f"[ANTIGRAVITY] 非流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500] if error_text else '无'}")
 
                     # 解析冷却时间
@@ -894,11 +916,10 @@ async def non_stream_request(
                             pass
 
                     # 并行预热下一个凭证,不阻塞当前处理
-                    if next_cred_task is None and attempt < max_retries:
+                    if next_cred_task is None and retry_config["retry_enabled"] and attempt < max_retries:
                         next_cred_task = asyncio.create_task(
-                                get_valid_credential(
-                                    model_name=model_name, session_key=session_key,
-                                    excluded_emails=excluded_emails,
+                                _select_retry_credential(
+                                    model_name, session_key, excluded_emails, retry_failed_email,
                                 )
                             )
 
@@ -941,7 +962,7 @@ async def non_stream_request(
                 if not switched:
                     # 换凭证失败，本次未调用谷歌 API，不产生日志
                     log.error("[ANTIGRAVITY] 重试时无可用凭证或令牌")
-                    return Response(
+                    return last_error_response or Response(
                         content=json.dumps({"error": "当前无可用凭证"}),
                         status_code=500,
                         media_type="application/json"

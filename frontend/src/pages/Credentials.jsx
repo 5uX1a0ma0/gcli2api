@@ -14,10 +14,11 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+import { runBatchVerification } from "../utils/batchVerification";
 
 export default function Credentials() {
   const [items, setItems] = useState([]);
@@ -40,6 +41,19 @@ export default function Credentials() {
   const [quotaModal, setQuotaModal] = useState(null); // { email } 额度弹窗
   const [quotaCache, setQuotaCache] = useState({}); // 缓存额度数据 { email: { claude, gemini } | { error } }
   const [modelStatuses, setModelStatuses] = useState({});
+  const [batchVerification, setBatchVerification] = useState(null);
+  const [batchDetailsOpen, setBatchDetailsOpen] = useState(false);
+  const batchJobRef = useRef(null);
+  const batchRunning = !!batchVerification?.running;
+
+  useEffect(() => () => {
+    const job = batchJobRef.current;
+    if (job) {
+      job.stop = true;
+      job.controller.abort();
+      batchJobRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
@@ -186,6 +200,61 @@ export default function Credentials() {
     } finally {
       setBusy(email, false);
     }
+  };
+
+  const verifySelectedProjects = async () => {
+    if (!selected.size || batchJobRef.current || busyFiles.has("__batch__")) return;
+    const emails = Array.from(selected);
+    const job = { stop: false, controller: new AbortController() };
+    batchJobRef.current = job;
+    setBusy("__batch__", true);
+    setBatchDetailsOpen(false);
+    setBatchVerification({
+      total: emails.length, completed: 0, success: 0, failed: 0,
+      running: true, stopping: false, stopped: false, results: [],
+    });
+    try {
+      const results = await runBatchVerification(emails, {
+        shouldStop: () => job.stop || job.controller.signal.aborted,
+        verify: async (email) => {
+          if (batchJobRef.current === job) setBusy(email, true);
+          const res = await api.post(`/creds/verify-project/${encodeURIComponent(email)}`, null, {
+            signal: job.controller.signal,
+          });
+          return res.data;
+        },
+        onResult: (result) => {
+          if (batchJobRef.current !== job) return;
+          setBusy(result.email, false);
+          setBatchVerification((prev) => ({
+            ...prev,
+            completed: prev.completed + 1,
+            success: prev.success + Number(result.success),
+            failed: prev.failed + Number(!result.success),
+            results: [...prev.results, result],
+          }));
+        },
+      });
+      if (batchJobRef.current !== job) return;
+      // 整批结束后统一刷新，避免每项检验重新加载列表和清空选择。
+      await fetchCreds();
+      if (batchJobRef.current !== job) return;
+      setBatchVerification((prev) => ({
+        ...prev, running: false, stopping: false,
+        stopped: job.stop && results.length < emails.length, results,
+      }));
+    } finally {
+      if (batchJobRef.current === job) {
+        batchJobRef.current = null;
+        setBusy("__batch__", false);
+      }
+    }
+  };
+
+  const stopBatchVerification = () => {
+    if (!batchJobRef.current) return;
+    batchJobRef.current.stop = true;
+    setBatchVerification((prev) => ({ ...prev, stopping: true }));
   };
 
   const testCredential = async (email) => {
@@ -408,7 +477,7 @@ export default function Credentials() {
       <div className="flex flex-wrap items-center gap-2">
         <button
           onClick={fetchCreds}
-          disabled={loading}
+          disabled={loading || batchRunning}
           className="btn btn-secondary text-xs sm:text-sm px-3 py-1.5 sm:px-4 sm:py-2 flex items-center gap-1.5"
         >
           <RefreshCw size={15} className={loading ? "animate-spin" : ""} />
@@ -428,6 +497,7 @@ export default function Credentials() {
       <div className="grid grid-cols-2 sm:flex sm:flex-wrap gap-2 sm:gap-3 text-sm">
         <Select
           value={statusFilter}
+          disabled={batchRunning}
           onChange={(v) => {
             setStatusFilter(v);
             setPage(1);
@@ -441,6 +511,7 @@ export default function Credentials() {
         />
         <Select
           value={errorCodeFilter}
+          disabled={batchRunning}
           onChange={(v) => {
             setErrorCodeFilter(v);
             setPage(1);
@@ -458,6 +529,7 @@ export default function Credentials() {
         />
         <Select
           value={cooldownFilter}
+          disabled={batchRunning}
           onChange={(v) => {
             setCooldownFilter(v);
             setPage(1);
@@ -471,6 +543,7 @@ export default function Credentials() {
         />
         <Select
           value={tierFilter}
+          disabled={batchRunning}
           onChange={(v) => {
             setTierFilter(v);
             setPage(1);
@@ -485,6 +558,7 @@ export default function Credentials() {
         />
         <Select
           value={paidFilter}
+          disabled={batchRunning}
           onChange={(v) => {
             setPaidFilter(v);
             setPage(1);
@@ -499,6 +573,7 @@ export default function Credentials() {
         />
         <Select
           value={pageSize}
+          disabled={batchRunning}
           onChange={(v) => {
             setPageSize(Number(v));
             setPage(1);
@@ -518,36 +593,126 @@ export default function Credentials() {
             <input
               type="checkbox"
               checked={selected.size === items.length && items.length > 0}
+              disabled={batchRunning || loading}
               onChange={toggleSelectAll}
               className="accent-purple-600 w-4 h-4"
             />
             全选
           </label>
           <span className="text-gray-500 text-xs">已选 {selected.size} 项</span>
-          <div className="flex flex-wrap gap-2">
+          <div className="grid grid-cols-2 gap-2 w-full sm:flex sm:flex-wrap sm:w-auto">
+            <button
+              type="button"
+              onClick={verifySelectedProjects}
+              disabled={selected.size === 0 || busyFiles.has("__batch__") || loading || Array.from(selected).some((email) => busyFiles.has(email))}
+              className="btn btn-primary text-xs px-3 py-1.5 min-h-10 flex items-center justify-center gap-1.5 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
+              title="批量重新获取 Project ID / Tier，成功后解除禁用并清除错误码"
+            >
+              {batchRunning ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : <Shield size={14} />}
+              批量检验
+            </button>
             <button
               onClick={() => doBatchAction("enable")}
               disabled={selected.size === 0 || busyFiles.has("__batch__")}
-              className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
+              className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 disabled:opacity-40"
             >
               批量启用
             </button>
             <button
               onClick={() => doBatchAction("disable")}
               disabled={selected.size === 0 || busyFiles.has("__batch__")}
-              className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
+              className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 disabled:opacity-40"
             >
               批量禁用
             </button>
             <button
               onClick={() => doBatchAction("delete")}
               disabled={selected.size === 0 || busyFiles.has("__batch__")}
-              className="btn btn-danger text-xs px-3 py-1.5 disabled:opacity-40"
+              className="btn btn-danger text-xs px-3 py-1.5 min-h-10 disabled:opacity-40"
             >
               批量删除
             </button>
           </div>
         </div>
+        <p className="mt-2 text-xs text-gray-400">
+          重新获取所选凭证的 Project ID / Tier；检验成功后解除禁用并清除错误码。
+        </p>
+        {batchVerification && (
+          <div className="mt-3 pt-3 border-t border-dark-700 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 text-xs space-y-1" aria-live="polite">
+                <div className="text-gray-200 font-medium">
+                  {batchVerification.running ? (batchVerification.stopping ? "正在停止后续检验" : "正在检验 Project / Tier")
+                    : batchVerification.stopped ? "批量检验已停止" : "批量检验完成"}
+                  <span className="text-gray-400 font-normal ml-2 tabular-nums">
+                    {batchVerification.completed} / {batchVerification.total}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-gray-400">
+                  <span className="text-emerald-400">成功 {batchVerification.success}</span>
+                  <span className={batchVerification.failed ? "text-red-400" : "text-gray-500"}>失败 {batchVerification.failed}</span>
+                  {batchVerification.stopped && <span>未检验 {batchVerification.total - batchVerification.completed}</span>}
+                </div>
+              </div>
+              {batchVerification.running && (
+                <button
+                  type="button"
+                  onClick={stopBatchVerification}
+                  disabled={batchVerification.stopping}
+                  className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 shrink-0 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
+                >
+                  {batchVerification.stopping ? "等待当前检验" : "停止后续检验"}
+                </button>
+              )}
+            </div>
+            <div
+              role="progressbar"
+              aria-label="批量 Project / Tier 检验进度"
+              aria-valuemin={0}
+              aria-valuemax={batchVerification.total}
+              aria-valuenow={batchVerification.completed}
+              className="h-1.5 rounded-full bg-dark-700 overflow-hidden"
+            >
+              <div
+                className="h-full bg-purple-500 transition-[width] duration-200 motion-reduce:transition-none"
+                style={{ width: `${batchVerification.completed / batchVerification.total * 100}%` }}
+              />
+            </div>
+            {batchVerification.completed > 0 && (
+              <button
+                type="button"
+                aria-expanded={batchDetailsOpen}
+                aria-controls="batch-verification-results"
+                onClick={() => setBatchDetailsOpen((open) => !open)}
+                className="text-xs text-gray-400 hover:text-white min-h-10 flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400 rounded-lg"
+              >
+                {batchDetailsOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                {batchDetailsOpen ? "收起检验结果" : "查看检验结果"}
+              </button>
+            )}
+            {batchDetailsOpen && (
+              <ul id="batch-verification-results" className="space-y-2 max-h-72 overflow-y-auto">
+                {batchVerification.results.map((result) => (
+                  <li key={result.email} className="rounded-lg bg-dark-800 px-3 py-2 text-xs space-y-1">
+                    <div className="flex items-start gap-2">
+                      {result.success ? <CheckCircle size={14} className="text-emerald-400 shrink-0 mt-0.5" />
+                        : <AlertCircle size={14} className="text-red-400 shrink-0 mt-0.5" />}
+                      <span className="text-gray-200 break-all min-w-0 flex-1">{result.email}</span>
+                      <span className={`${result.success ? "text-emerald-400" : "text-red-400"} shrink-0`}>
+                        {result.success ? "成功" : "失败"}
+                      </span>
+                    </div>
+                    {result.success ? (
+                      <div className="text-gray-400 break-all">Project={result.project_id} · Tier={result.subscription_tier}</div>
+                    ) : (
+                      <div className="text-red-300 whitespace-pre-wrap break-all">{result.status_code ? `HTTP ${result.status_code} · ` : ""}{result.message}</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 凭证卡片列表 */}
@@ -578,6 +743,8 @@ export default function Credentials() {
                   <input
                     type="checkbox"
                     checked={selected.has(cred.email)}
+                    disabled={batchRunning}
+                    aria-label={`选择凭证 ${cred.email}`}
                     onChange={() => toggleSelect(cred.email)}
                     className="accent-purple-600 w-4 h-4 flex-shrink-0 mt-0.5"
                   />
@@ -594,7 +761,7 @@ export default function Credentials() {
                       <button
                         type="button"
                         onClick={() => refreshPaid(cred.email)}
-                        disabled={busy || paidLoading}
+                        disabled={busy || paidLoading || batchRunning}
                         title={paidLoading ? "正在查询可用模型" : "点击重新识别 Paid"}
                         className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border ${
                           paid === true ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
@@ -654,10 +821,10 @@ export default function Credentials() {
                 </div>
 
                 {/* 操作按钮（2×3 网格铺满卡片） */}
-                <div className="grid grid-cols-3 gap-1.5 pt-1 border-t border-dark-700">
+                <fieldset disabled={batchRunning} className="grid grid-cols-3 gap-1.5 pt-1 border-t border-dark-700 min-w-0 disabled:opacity-50">
                   {busy ? (
                     <div className="col-span-3 flex items-center justify-center py-1.5">
-                      <Loader2 size={16} className="animate-spin text-purple-400" />
+                      <Loader2 size={16} className="animate-spin motion-reduce:animate-none text-purple-400" />
                     </div>
                   ) : (
                     <>
@@ -712,7 +879,7 @@ export default function Credentials() {
                       </button>
                     </>
                   )}
-                </div>
+                </fieldset>
               </div>
             );
           })}
@@ -728,7 +895,7 @@ export default function Credentials() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page <= 1}
+              disabled={page <= 1 || batchRunning}
               className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
             >
               上一页
@@ -738,7 +905,7 @@ export default function Credentials() {
             </span>
             <button
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              disabled={page >= totalPages}
+              disabled={page >= totalPages || batchRunning}
               className="btn btn-secondary text-xs px-3 py-1.5 disabled:opacity-40"
             >
               下一页

@@ -49,6 +49,7 @@ ENV_MAPPINGS = {
     "REQUEST_LOG_ENABLED": "request_log_enabled",
     "REQUEST_LOG_ERROR_CODES": "request_log_error_codes",
     "CREDENTIAL_SELECT_MODE": "credential_select_mode",
+    "FREE_ACCOUNT_PRIORITY_ENABLED": "free_account_priority_enabled",
     "HOST": "host",
     "PORT": "port",
     "API_PASSWORD": "api_password",
@@ -736,6 +737,16 @@ async def get_credential_select_mode() -> str:
         log.warning(f"无效的凭证选择模式: {value}，回落为 cache")
         return "cache"
     return value
+
+
+async def get_free_account_priority_enabled() -> bool:
+    """默认优先使用支持目标模型的 Non-paid 凭证，可通过面板或环境变量关闭。"""
+    value = await get_config_value(
+        "free_account_priority_enabled", True, "FREE_ACCOUNT_PRIORITY_ENABLED"
+    )
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
 
 
 async def get_oauth_proxy_url() -> str:
