@@ -1,4 +1,4 @@
-full_hash=dfcfb52b1d167020adf5307a794c2b3234043325
-short_hash=dfcfb52
-message=Update utils.py
-date=2026-11-10 12:29:05 +0800
+full_hash=e63b3301617ab2375df292047ec2da14094b8704
+short_hash=e63b330
+message=image 模型独立 CD 键，优先级排在 gemini 之前
+date=2026-11-12 11:32:56 +0800

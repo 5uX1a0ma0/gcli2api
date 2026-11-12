@@ -150,7 +150,7 @@ docker compose -f docker-compose.yml up -d --no-deps --pull never agy2api
 - 按每个凭证的实际可用模型自动分流，兼容免费/付费凭证混用，与账户 PRO/ULTRA 等级无关
 - 默认优先使用支持目标模型的 Non-paid 账户，没有可用免费账户时回退其他账户；可在配置页关闭
 - 凭证管理页缓存 Paid / Non-paid / 未识别标记并支持筛选，按可用模型能力识别，模型列表查询不会执行模型生成请求
-- 模型级冷却（429 错误自动设置对应模型家族的 CD：argon / gemini / claude+gpt 共享冷却）
+- 模型级冷却（429 错误自动设置对应模型家族的 CD：image / argon / gemini / claude+gpt 共享冷却）
 - 自动故障检测和凭证禁用
 - 凭证使用统计和配额/额度查询
 - 批量操作（启用、禁用、删除）
