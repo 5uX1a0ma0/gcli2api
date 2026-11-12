@@ -245,5 +245,12 @@ class CredFileBatchActionRequest(BaseModel):
     emails: List[str]
 
 
+class CredDeduplicateRequest(BaseModel):
+    # None 扫描全部；空数组不代表全部，避免意外扩大清理范围。
+    emails: Optional[List[str]] = None
+    dry_run: bool = True
+    preview: Optional[str] = None
+
+
 class ConfigSaveRequest(BaseModel):
     config: dict

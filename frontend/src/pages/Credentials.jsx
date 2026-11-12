@@ -8,6 +8,7 @@ import {
   Clock,
   Download,
   Loader2,
+  Mail,
   RefreshCw,
   Shield,
   Snowflake,
@@ -17,6 +18,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
+import CredentialDeduplication from "../components/CredentialDeduplication";
 import api from "../api";
 import { runBatchVerification } from "../utils/batchVerification";
 
@@ -43,8 +45,20 @@ export default function Credentials() {
   const [modelStatuses, setModelStatuses] = useState({});
   const [batchVerification, setBatchVerification] = useState(null);
   const [batchDetailsOpen, setBatchDetailsOpen] = useState(false);
+  const [deduplicationOpen, setDeduplicationOpen] = useState(false);
+  const [deduplicationBusy, setDeduplicationBusyState] = useState(false);
   const batchJobRef = useRef(null);
-  const batchRunning = !!batchVerification?.running;
+  const batchRunning = !!batchVerification?.running || deduplicationBusy;
+
+  const setDeduplicationBusy = useCallback((busy) => {
+    setDeduplicationBusyState(busy);
+    setBusyFiles((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add("__batch__");
+      else next.delete("__batch__");
+      return next;
+    });
+  }, []);
 
   useEffect(() => () => {
     const job = batchJobRef.current;
@@ -608,7 +622,7 @@ export default function Credentials() {
               className="btn btn-primary text-xs px-3 py-1.5 min-h-10 flex items-center justify-center gap-1.5 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
               title="批量重新获取 Project ID / Tier，成功后解除禁用并清除错误码"
             >
-              {batchRunning ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : <Shield size={14} />}
+              {batchVerification?.running ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : <Shield size={14} />}
               批量检验
             </button>
             <button
@@ -626,6 +640,16 @@ export default function Credentials() {
               批量禁用
             </button>
             <button
+              type="button"
+              onClick={() => setDeduplicationOpen((open) => !open)}
+              disabled={!stats.total || loading || busyFiles.size > 0}
+              aria-expanded={deduplicationOpen}
+              aria-controls="credential-deduplication"
+              className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 flex items-center justify-center gap-1.5 disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-purple-400"
+            >
+              <Mail size={14} />邮箱去重
+            </button>
+            <button
               onClick={() => doBatchAction("delete")}
               disabled={selected.size === 0 || busyFiles.has("__batch__")}
               className="btn btn-danger text-xs px-3 py-1.5 min-h-10 disabled:opacity-40"
@@ -637,6 +661,20 @@ export default function Credentials() {
         <p className="mt-2 text-xs text-gray-400">
           重新获取所选凭证的 Project ID / Tier；检验成功后解除禁用并清除错误码。
         </p>
+        {deduplicationOpen && (
+          <CredentialDeduplication
+            selectedEmails={Array.from(selected)}
+            totalCount={stats.total}
+            onBusyChange={setDeduplicationBusy}
+            onRefresh={async () => {
+              setQuotaCache({});
+              setBatchVerification(null);
+              if (page !== 1) setPage(1);
+              else await fetchCreds();
+            }}
+            onClose={() => setDeduplicationOpen(false)}
+          />
+        )}
         {batchVerification && (
           <div className="mt-3 pt-3 border-t border-dark-700 space-y-3">
             <div className="flex items-start justify-between gap-3">

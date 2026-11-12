@@ -2,7 +2,6 @@
 API 客户端共用基础功能：自动封禁、错误重试、调用结果记录、冷却解析
 """
 
-import asyncio
 import json
 import re
 import time
@@ -15,6 +14,7 @@ from config import (
     get_retry_429_enabled,
     get_retry_429_interval,
     get_retry_429_max_retries,
+    get_retry_error_codes,
 )
 from log import log
 from src.credential_manager import record_api_call_result, set_cred_disabled
@@ -44,16 +44,13 @@ async def handle_error_with_retry(
     attempt: int,
     max_retries: int,
     retry_interval: float,
+    retry_error_codes: Optional[list[int]] = None,
 ) -> bool:
     """
     统一处理错误和重试逻辑
 
-    仅在以下情况下进行自动重试:
-    1. 429错误(速率限制)
-    2. 503错误(服务不可用)
-    3. 500错误(服务临时不可用)
-    4. 400/403错误（请求或凭证被上游拒绝）
-    5. 导致凭证封禁的错误(AUTO_BAN_ERROR_CODES配置)
+    自动禁用与重试分别判断；仅配置的错误码在开关和次数允许时重试。
+    等待间隔由调用方切换凭证时执行一次。
 
     Returns:
         bool: True表示需要继续重试，False表示不需要重试
@@ -62,23 +59,13 @@ async def handle_error_with_retry(
     if await check_should_auto_ban(status_code):
         await handle_auto_ban(status_code, email)
 
-        # 自动封禁后，仍然尝试重试（会在下次循环中自动获取新凭证）
-        if retry_enabled and attempt < max_retries:
-            log.info(
-                f"[RETRY] Retrying with next credential after auto-ban "
-                f"(status {status_code}, attempt {attempt + 1}/{max_retries})"
-            )
-            await asyncio.sleep(retry_interval)
-            return True
-        return False
-
-    # 重试与自动封禁独立：400/403 即使未配置自动封禁也可重试。
-    if status_code in (400, 403, 429, 500, 503) and retry_enabled and attempt < max_retries:
+    if retry_error_codes is None:
+        retry_error_codes = await get_retry_error_codes()
+    if status_code in retry_error_codes and retry_enabled and attempt < max_retries:
         log.info(
             f"[RETRY] {status_code} error encountered, retrying "
             f"(attempt {attempt + 1}/{max_retries})"
         )
-        await asyncio.sleep(retry_interval)
         return True
 
     return False
@@ -92,6 +79,7 @@ async def get_retry_config() -> Dict[str, Any]:
         "retry_enabled": await get_retry_429_enabled(),
         "max_retries": await get_retry_429_max_retries(),
         "retry_interval": await get_retry_429_interval(),
+        "retry_error_codes": await get_retry_error_codes(),
     }
 
 

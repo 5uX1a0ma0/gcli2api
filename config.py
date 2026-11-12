@@ -13,6 +13,8 @@ import re
 from typing import Any, Optional
 
 from log import log
+from src.error_codes import parse_error_codes
+from src.storage.database import get_database
 
 # 全局配置缓存
 _config_cache: dict[str, Any] = {}
@@ -22,6 +24,7 @@ _config_initialized = False
 
 # 需要自动封禁的错误码 (默认值，可通过环境变量或配置覆盖)
 AUTO_BAN_ERROR_CODES = [403]
+RETRY_ERROR_CODES = [400, 403, 429, 500, 503]
 
 # ====================== 环境变量映射表 ======================
 # 统一维护环境变量名和配置键名的映射关系
@@ -34,6 +37,7 @@ ENV_MAPPINGS = {
     "ANTIGRAVITY_API_URL": "antigravity_api_url",
     "AUTO_BAN": "auto_ban_enabled",
     "AUTO_BAN_ERROR_CODES": "auto_ban_error_codes",
+    "RETRY_ERROR_CODES": "retry_error_codes",
     "RETRY_429_MAX_RETRIES": "retry_429_max_retries",
     "RETRY_429_ENABLED": "retry_429_enabled",
     "RETRY_429_INTERVAL": "retry_429_interval",
@@ -67,7 +71,6 @@ async def init_config():
         return
 
     try:
-        from src.storage.database import get_database
         database = await get_database()
         _config_cache = await database.get_all_config()
         _config_initialized = True
@@ -82,7 +85,6 @@ async def reload_config():
     global _config_cache, _config_initialized
 
     try:
-        from src.storage.database import get_database
         database = await get_database()
 
         # 重新加载数据库配置缓存
@@ -148,29 +150,35 @@ async def get_auto_ban_enabled() -> bool:
     return bool(await get_config_value("auto_ban_enabled", False))
 
 
-async def get_auto_ban_error_codes() -> list:
-    """
-    Get auto ban error codes.
-
-    Environment variable: AUTO_BAN_ERROR_CODES (comma-separated, e.g., "400,403")
-    Database config key: auto_ban_error_codes
-    Default: [400, 403]
-    """
-    env_value = os.getenv("AUTO_BAN_ERROR_CODES")
+async def _get_error_codes(key: str, env_var: str, default: list[int]) -> list[int]:
+    """环境变量与数据库使用相同格式；无效值回退并记录原因。"""
+    env_value = os.getenv(env_var)
     if env_value:
         try:
-            return [int(code.strip()) for code in env_value.split(",") if code.strip()]
-        except ValueError:
-            pass
+            return parse_error_codes(env_value)
+        except ValueError as exc:
+            log.warning(f"{env_var} 配置无效，使用数据库配置或默认值: {exc}")
+    value = await get_config_value(key)
+    if value is not None:
+        try:
+            return parse_error_codes(value)
+        except ValueError as exc:
+            log.warning(f"{key} 配置无效，使用默认值: {exc}")
+    return list(default)
 
-    codes = await get_config_value("auto_ban_error_codes")
-    if codes and isinstance(codes, list):
-        return codes
-    return AUTO_BAN_ERROR_CODES
+
+async def get_auto_ban_error_codes() -> list[int]:
+    """自动禁用错误码，默认 [403]；空列表表示不按状态码禁用。"""
+    return await _get_error_codes("auto_ban_error_codes", "AUTO_BAN_ERROR_CODES", AUTO_BAN_ERROR_CODES)
+
+
+async def get_retry_error_codes() -> list[int]:
+    """触发自动重试的 HTTP 错误码，与自动禁用设置独立。"""
+    return await _get_error_codes("retry_error_codes", "RETRY_ERROR_CODES", RETRY_ERROR_CODES)
 
 
 async def get_retry_429_max_retries() -> int:
-    """Get max retries for 429 errors."""
+    """Get maximum automatic error retries (legacy setting name)."""
     env_value = os.getenv("RETRY_429_MAX_RETRIES")
     if env_value:
         try:
@@ -182,7 +190,7 @@ async def get_retry_429_max_retries() -> int:
 
 
 async def get_retry_429_enabled() -> bool:
-    """Get 429 retry enabled setting."""
+    """Get automatic error retry switch (legacy setting name)."""
     env_value = os.getenv("RETRY_429_ENABLED")
     if env_value:
         return env_value.lower() in ("true", "1", "yes", "on")
@@ -191,7 +199,7 @@ async def get_retry_429_enabled() -> bool:
 
 
 async def get_retry_429_interval() -> float:
-    """Get 429 retry interval in seconds."""
+    """Get automatic error retry interval in seconds (legacy setting name)."""
     env_value = os.getenv("RETRY_429_INTERVAL")
     if env_value:
         try:
@@ -701,17 +709,7 @@ async def get_request_log_error_codes() -> list:
     Database config key: request_log_error_codes
     Default: [400]
     """
-    env_value = os.getenv("REQUEST_LOG_ERROR_CODES")
-    if env_value:
-        try:
-            return [int(code.strip()) for code in env_value.split(",") if code.strip()]
-        except ValueError:
-            pass
-
-    codes = await get_config_value("request_log_error_codes")
-    if codes and isinstance(codes, list):
-        return codes
-    return [400]
+    return await _get_error_codes("request_log_error_codes", "REQUEST_LOG_ERROR_CODES", [400]) or [400]
 
 
 # ====================== 凭证选择模式 ======================

@@ -41,7 +41,8 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["auto_ban_enabled"] = await config.get_auto_ban_enabled()
         current_config["auto_ban_error_codes"] = await config.get_auto_ban_error_codes()
 
-        # 429重试配置
+        # 自动重试配置（保留原配置键名）
+        current_config["retry_error_codes"] = await config.get_retry_error_codes()
         current_config["retry_429_max_retries"] = await config.get_retry_429_max_retries()
         current_config["retry_429_enabled"] = await config.get_retry_429_enabled()
         current_config["retry_429_interval"] = await config.get_retry_429_interval()
@@ -111,25 +112,36 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         log.debug(f"收到的配置数据: {list(new_config.keys())}")
 
         # 验证配置项
+        for key, label in (
+            ("auto_ban_error_codes", "自动封禁错误码"),
+            ("retry_error_codes", "自动重试错误码"),
+            ("request_log_error_codes", "详细日志错误码"),
+        ):
+            if key in new_config:
+                try:
+                    new_config[key] = config.parse_error_codes(new_config[key])
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"{label}无效：{exc}") from exc
+
         if "retry_429_max_retries" in new_config:
             if (
                 not isinstance(new_config["retry_429_max_retries"], int)
                 or new_config["retry_429_max_retries"] < 0
             ):
-                raise HTTPException(status_code=400, detail="最大429重试次数必须是大于等于0的整数")
+                raise HTTPException(status_code=400, detail="最大重试次数必须是大于等于0的整数")
 
         if "retry_429_enabled" in new_config:
             if not isinstance(new_config["retry_429_enabled"], bool):
-                raise HTTPException(status_code=400, detail="429重试开关必须是布尔值")
+                raise HTTPException(status_code=400, detail="错误重试开关必须是布尔值")
 
         # 验证新的配置项
         if "retry_429_interval" in new_config:
             try:
                 interval = float(new_config["retry_429_interval"])
                 if interval < 0 or interval > 3600:
-                    raise HTTPException(status_code=400, detail="429重试间隔必须在0-3600秒之间")
+                    raise HTTPException(status_code=400, detail="重试间隔必须在0-3600秒之间")
             except (ValueError, TypeError):
-                raise HTTPException(status_code=400, detail="429重试间隔必须是有效的数字")
+                raise HTTPException(status_code=400, detail="重试间隔必须是有效的数字")
 
         if "anti_truncation_max_attempts" in new_config:
             if (
@@ -227,18 +239,6 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         if "request_log_enabled" in new_config:
             if not isinstance(new_config["request_log_enabled"], bool):
                 raise HTTPException(status_code=400, detail="请求体详细日志开关必须是布尔值")
-
-        if "request_log_error_codes" in new_config:
-            codes = new_config["request_log_error_codes"]
-            if not isinstance(codes, list):
-                raise HTTPException(status_code=400, detail="详细日志错误码必须是数组，如 [400, 429]")
-            cleaned_codes = []
-            for code in codes:
-                if isinstance(code, bool) or not isinstance(code, int) or code < 100 or code > 599:
-                    raise HTTPException(status_code=400, detail=f"错误码必须是 100-599 的整数: {code!r}")
-                if code not in cleaned_codes:
-                    cleaned_codes.append(code)
-            new_config["request_log_error_codes"] = sorted(cleaned_codes)
 
         # 验证凭证选择模式
         if "credential_select_mode" in new_config:

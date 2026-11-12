@@ -42,10 +42,12 @@ from src.google_oauth_api import (
     get_user_email,
 )
 from config import get_antigravity_api_url
+from .credential_deduplication import router as deduplication_router
 
 
 # 创建路由器
 router = APIRouter(prefix="/creds", tags=["credentials"])
+router.include_router(deduplication_router)
 
 
 # =============================================================================

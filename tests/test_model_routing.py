@@ -1035,3 +1035,157 @@ async def test_400_retry_can_fall_back_from_free_to_paid_credentials(env, monkey
     assert isinstance(result, list) if stream else result.status_code == 200
     assert [token for token, _ in env.upstream.generated] == ["free", "paid"]
     assert await env.db.get_disabled_model_ids(free) == set()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [401, 408, 500, 502, 504])
+async def test_custom_retry_codes_drive_both_request_paths(env, monkeypatch, stream, status):
+    first, _ = await env.add("first", [NEW_CLAUDE])
+    await env.add("second", [NEW_CLAUDE])
+    config._config_cache.update({
+        "credential_select_mode": "sticky", "retry_429_enabled": True,
+        "retry_429_max_retries": 1, "retry_error_codes": [status], "auto_ban_enabled": False,
+    })
+    manager._sticky_email = first
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    env.upstream.outcomes["first"] = [(status, "temporary failure")]
+    result = await call_api(stream)
+    assert isinstance(result, list) if stream else result.status_code == 200
+    assert [token for token, _ in env.upstream.generated] == ["first", "second"]
+    assert (await env.db.get_credential_state(first))["disabled"] is False
+    assert api.record_usage_log.await_count == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [400, 403, 500, 502])
+async def test_unlisted_http_errors_are_returned_without_retry(env, stream, status):
+    await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 2,
+        "retry_error_codes": [429], "auto_ban_enabled": False,
+    })
+    env.upstream.outcomes["token"] = [(status, "original error")]
+    result = await call_api(stream)
+    assert result.status_code == status
+    assert json.loads(result.body)["error"]["message"] == "original error"
+    assert len(env.upstream.generated) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("retry_codes", [[429], [401]])
+async def test_custom_auto_ban_does_not_override_retry_codes(env, monkeypatch, stream, retry_codes):
+    first, _ = await env.add("first", [NEW_CLAUDE])
+    await env.add("second", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 2,
+        "retry_error_codes": retry_codes, "auto_ban_enabled": True,
+        "auto_ban_error_codes": [401],
+    })
+    monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
+    env.upstream.outcomes["first"] = [(401, "unauthorized")]
+    result = await call_api(stream)
+    assert (await env.db.get_credential_state(first))["disabled"] is True
+    if 401 in retry_codes:
+        assert isinstance(result, list) if stream else result.status_code == 200
+        assert [token for token, _ in env.upstream.generated] == ["first", "second"]
+    else:
+        assert result.status_code == 401
+        assert [token for token, _ in env.upstream.generated] == ["first"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_retry_switch_blocks_custom_codes_even_with_nonzero_limit(env, stream):
+    await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": False, "retry_429_max_retries": 2,
+        "retry_error_codes": [502], "auto_ban_enabled": False,
+    })
+    env.upstream.outcomes["token"] = [(502, "bad gateway")]
+    result = await call_api(stream)
+    assert result.status_code == 502 and len(env.upstream.generated) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_retry_error_interval_is_applied_once_per_attempt(env, monkeypatch, stream):
+    await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 1,
+        "retry_429_interval": 0.25, "retry_error_codes": [503], "auto_ban_enabled": False,
+    })
+    original_sleep = asyncio.sleep
+    delays = []
+
+    async def sleep_without_delay(delay):
+        delays.append(delay)
+        await original_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep_without_delay)
+    env.upstream.outcomes["token"] = [(503, "unavailable")]
+    result = await call_api(stream)
+    assert isinstance(result, list) if stream else result.status_code == 200
+    assert delays.count(0.25) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("kind", ["empty", "exception"])
+@pytest.mark.parametrize("codes", [[], [500]])
+async def test_empty_responses_and_connection_errors_obey_retry_codes(
+    env, monkeypatch, stream, kind, codes
+):
+    await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 1,
+        "retry_error_codes": codes, "auto_ban_enabled": False,
+    })
+    calls = 0
+    success = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+
+    async def post(url, json=None, headers=None, **kwargs):
+        nonlocal calls
+        if url.endswith(":fetchAvailableModels"):
+            return await env.upstream.post(url, json=json, headers=headers, **kwargs)
+        calls += 1
+        if calls == 1:
+            if kind == "exception":
+                raise RuntimeError("connection interrupted")
+            return httpx.Response(200, content=b"")
+        return httpx.Response(200, json=success)
+
+    async def stream_post(url, body, native=False, headers=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if kind == "exception":
+                raise RuntimeError("connection interrupted")
+            return
+        yield f"data: {json.dumps(success)}"
+
+    monkeypatch.setattr(api, "post_async", post)
+    monkeypatch.setattr(api, "stream_post_async", stream_post)
+    result = await call_api(stream)
+    if 500 in codes:
+        assert isinstance(result, list) if stream else result.status_code == 200
+        assert calls == 2
+    else:
+        assert result.status_code == 500 and calls == 1
+
+
+async def test_interrupted_stream_does_not_replay_already_emitted_content(env, monkeypatch):
+    await env.add("token", [NEW_CLAUDE])
+    config._config_cache.update({
+        "retry_429_enabled": True, "retry_429_max_retries": 2,
+        "retry_error_codes": [500], "auto_ban_enabled": False,
+    })
+    calls = 0
+    first_chunk = 'data: {"candidates":[{"content":{"parts":[{"text":"first"}]}}]}'
+
+    async def interrupted(url, body, native=False, headers=None):
+        nonlocal calls
+        calls += 1
+        yield first_chunk
+        raise RuntimeError("stream interrupted")
+
+    monkeypatch.setattr(api, "stream_post_async", interrupted)
+    chunks = [chunk async for chunk in api.stream_request(request_body())]
+    assert calls == 1 and chunks[0] == first_chunk
+    assert len(chunks) == 2 and chunks[1].status_code == 500

@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    delete,
     event,
     func,
     inspect,
@@ -164,6 +166,21 @@ def _row_to_credential_dict(row: AntigravityCredential) -> Dict[str, Any]:
         "project_id": row.project_id or "",
         "expiry": row.expiry or "",
     }
+
+
+def _credential_deduplication_snapshot(row: AntigravityCredential) -> Dict[str, Any]:
+    """去重快照仅用散列对外标识，凭证明文留在服务端。"""
+    snapshot = {
+        "id": row.id,
+        "email": row.email,
+        "credential_data": _row_to_credential_dict(row),
+        "disabled": bool(row.disabled),
+        "model_cooldowns": row.model_cooldowns,
+    }
+    snapshot["fingerprint"] = hashlib.sha256(
+        _dump_json(snapshot).encode("utf-8")
+    ).hexdigest()
+    return snapshot
 
 
 def get_cooldown_group(model_name: str) -> str:
@@ -408,6 +425,97 @@ class Database:
                 await s.delete(row)
                 return True
             return False
+
+    async def get_credential_deduplication_snapshots(
+        self, emails: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """读取所选或全部凭证，保留创建顺序作为稳定的去重保留规则。"""
+        async with self.session() as s:
+            query = select(AntigravityCredential).order_by(AntigravityCredential.id)
+            if emails is not None:
+                query = query.where(AntigravityCredential.email.in_(emails))
+            return [_credential_deduplication_snapshot(row) for row in await s.scalars(query)]
+
+    async def apply_credential_deduplication(
+        self, groups: List[Dict[str, Any]], verified: Dict[str, Dict[str, Any]]
+    ) -> List[str]:
+        """核对已验证的快照后原子清理；任一凭证变化则整批回滚。"""
+        affected = {
+            email for group in groups
+            for email in [group["keep_email"], *group["duplicate_emails"]]
+        }
+        if not affected:
+            return []
+        removed = []
+        async with self.session() as s:
+            rows = (await s.scalars(
+                select(AntigravityCredential)
+                .where(AntigravityCredential.email.in_(affected))
+                .order_by(AntigravityCredential.id)
+                .with_for_update()
+            )).all()
+            by_email = {row.email: row for row in rows}
+            for email in affected:
+                if (email not in by_email or
+                        _credential_deduplication_snapshot(by_email[email])["fingerprint"]
+                        != verified[email]["snapshot"]["fingerprint"]):
+                    raise ValueError("凭证已变化，请重新扫描后再去重")
+
+            disabled_models = (await s.scalars(
+                select(DisabledCredentialModel).where(DisabledCredentialModel.email.in_(affected))
+            )).all()
+            for group in groups:
+                keep_email = group["keep_email"]
+                members = [keep_email, *group["duplicate_emails"]]
+                cooldowns = _load_json(by_email[keep_email].model_cooldowns, {})
+                for email in members:
+                    for model, until in _load_json(by_email[email].model_cooldowns, {}).items():
+                        cooldowns[model] = max(cooldowns.get(model, 0), until)
+
+                keep_snapshot = verified[keep_email]["snapshot"]
+                conditions = [
+                    AntigravityCredential.id == keep_snapshot["id"],
+                    AntigravityCredential.email == keep_email,
+                    AntigravityCredential.disabled == keep_snapshot["disabled"],
+                    AntigravityCredential.model_cooldowns == keep_snapshot["model_cooldowns"],
+                    *[getattr(AntigravityCredential, key) == value
+                      for key, value in keep_snapshot["credential_data"].items()],
+                ]
+                # 条件更新也为 SQLite 获取写锁，防止核对之后保留项被并发删除/覆盖。
+                result = await s.execute(
+                    AntigravityCredential.__table__.update().where(*conditions).values(
+                        **verified[keep_email]["credential_data"],
+                        model_cooldowns=_dump_json(cooldowns),
+                        updated_at=time.time(),
+                    )
+                )
+                if result.rowcount != 1:
+                    raise ValueError("保留凭证已变化，请重新扫描后再去重")
+
+                existing_models = {
+                    row.model_name for row in disabled_models if row.email == keep_email
+                }
+                for row in disabled_models:
+                    if row.email in members and row.model_name not in existing_models:
+                        s.add(DisabledCredentialModel(
+                            email=keep_email, model_name=row.model_name, created_at=row.created_at,
+                        ))
+                        existing_models.add(row.model_name)
+
+                for email in group["duplicate_emails"]:
+                    snapshot = verified[email]["snapshot"]
+                    result = await s.execute(delete(AntigravityCredential).where(
+                        AntigravityCredential.id == snapshot["id"],
+                        AntigravityCredential.email == email,
+                        AntigravityCredential.disabled == snapshot["disabled"],
+                        AntigravityCredential.model_cooldowns == snapshot["model_cooldowns"],
+                        *[getattr(AntigravityCredential, key) == value
+                          for key, value in snapshot["credential_data"].items()],
+                    ))
+                    if result.rowcount != 1:
+                        raise ValueError("重复凭证已变化，请重新扫描后再去重")
+                    removed.append(email)
+        return removed
 
     async def get_next_available_credential(
         self, model_name: Optional[str] = None, excluded_emails: Optional[set[str]] = None,

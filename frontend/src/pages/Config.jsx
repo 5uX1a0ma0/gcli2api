@@ -2,50 +2,9 @@ import { Loader2, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
+import ErrorCodesField from "../components/ErrorCodesField";
 import api from "../api";
-
-// 错误码输入：编辑期间保留原始文本，仅在按键时把已解析的数组回写配置（保证保存时取到最新值），
-// 失焦时再归一化显示。原实现在每次按键即时解析并回写数组，导致分隔符与未成形的中间输入被即时
-// 过滤/截断，无法输入多个错误码，也无法输入小于 100 的中间数字。
-function CsvNumbersField({ value, onChange, placeholder }) {
-  const toText = (v) => (Array.isArray(v) ? v.join(", ") : (v ?? ""));
-  const [text, setText] = useState(() => toText(value));
-  const focusedRef = useRef(false);
-
-  // 仅在非编辑态（失焦）时同步外部配置变化，避免编辑过程中被即时覆盖
-  useEffect(() => {
-    if (!focusedRef.current) setText(toText(value));
-  }, [value]);
-
-  const commitText = (raw) => {
-    const nums = raw
-      .split(/[,\s]+/)
-      .map((x) => parseInt(x, 10))
-      .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
-    onChange([...new Set(nums)].sort((a, b) => a - b));
-  };
-
-  return (
-    <input
-      type="text"
-      value={text}
-      onFocus={() => {
-        focusedRef.current = true;
-      }}
-      onChange={(e) => {
-        const raw = e.target.value;
-        setText(raw);
-        commitText(raw);
-      }}
-      onBlur={() => {
-        focusedRef.current = false;
-        commitText(text);
-      }}
-      placeholder={placeholder}
-      className="w-full sm:w-64 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
-    />
-  );
-}
+import { parseErrorCodes } from "../utils/errorCodes.mjs";
 
 // 多行文本（敏感词 / IP 白名单等，每行一条）：编辑期间保留原始文本（允许末尾空行与连续回车），
 // 仅在按键时把清洗后的数组回写配置（保证保存时取到最新值），失焦时再归一化显示。
@@ -127,13 +86,14 @@ const CONFIG_GROUPS = [
     title: "自动封禁配置",
     fields: [
       { key: "auto_ban_enabled", label: "启用自动封禁", type: "bool", note: "遇到指定错误码时自动禁用凭证" },
-      { key: "auto_ban_error_codes", label: "自动封禁错误码", type: "text", note: "JSON 数组格式，如 [403, 400]" },
+      { key: "auto_ban_error_codes", label: "自动封禁错误码", type: "error_codes", placeholder: "403, 400 或 [403, 400]", emptyHint: "格式有效：空列表，不按状态码自动禁用凭证", note: "支持 403, 400 或 [403, 400]，方括号可省略；使用英文逗号，范围 100–599。留空不按状态码自动禁用。" },
     ],
   },
   {
     title: "重试配置",
     fields: [
-      { key: "retry_429_enabled", label: "启用错误重试", type: "bool", note: "遇到错误时自动重试" },
+      { key: "retry_429_enabled", label: "启用错误重试", type: "bool", note: "遇到下方指定错误码时自动重试，与自动封禁开关独立" },
+      { key: "retry_error_codes", label: "自动重试错误码", type: "error_codes", placeholder: "400, 403, 429, 500, 503", emptyHint: "格式有效：空列表，不按状态码自动重试", note: "支持 429, 503 或 [429, 503]，方括号可省略；使用英文逗号，范围 100–599。默认 400, 403, 429, 500, 503；留空不按状态码重试。" },
       { key: "retry_429_max_retries", label: "最大重试次数", type: "number", note: "遇到错误时的最大重试次数" },
       { key: "retry_429_interval", label: "重试间隔（秒）", type: "number", note: "两次重试间的等待秒数，允许 0（立即重试），范围 0-3600" },
     ],
@@ -202,10 +162,13 @@ const CONFIG_GROUPS = [
     fields: [
       { key: "usage_log_enabled", label: "启用请求日志", type: "bool", note: "记录每次 API 请求（模型、凭证、token 用量、耗时、状态）到数据库，在\"请求日志\"页面查看。日志不自动清理，可在该页面手动清理或清空" },
       { key: "request_log_enabled", label: "启用请求体详细日志", type: "bool", note: "开启后，当请求命中下方错误码时，把发往上游的完整请求头（已脱敏）与请求体保存为 JSON 文件（data/request_logs/）。主要用于请求体错误时排查 debug；清理/清空日志时会同步删除这些文件" },
-      { key: "request_log_error_codes", label: "详细日志错误码", type: "csv_numbers", showIf: (cfg) => !!cfg.request_log_enabled, note: "仅当最终响应状态码命中此列表时记录详细日志，逗号分隔，如 400, 429。留空默认只记录 400", placeholder: "400, 429" },
+      { key: "request_log_error_codes", label: "详细日志错误码", type: "error_codes", note: "仅当最终响应状态码命中此列表时记录详细日志。支持 400, 429 或 [400, 429]，方括号可省略；使用英文逗号，范围 100–599。留空默认只记录 400。", emptyHint: "格式有效：留空使用默认错误码 400", placeholder: "400, 429 或 [400, 429]" },
     ],
   },
 ];
+
+const ERROR_CODE_FIELDS = CONFIG_GROUPS.flatMap((group) => group.fields)
+  .filter((field) => field.type === "error_codes");
 
 export default function Config() {
   const [config, setConfig] = useState({});
@@ -213,6 +176,9 @@ export default function Config() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
+  const invalidCodeFields = ERROR_CODE_FIELDS.filter((field) =>
+    !envLocked.includes(field.key) && !parseErrorCodes(config[field.key]).valid
+  );
 
   useEffect(() => {
     loadConfig();
@@ -233,9 +199,19 @@ export default function Config() {
   };
 
   const saveConfig = async () => {
+    if (invalidCodeFields.length) {
+      setMessage({ type: "error", text: `请修正无效的错误码：${invalidCodeFields.map((field) => field.label).join("、")}` });
+      return;
+    }
+    const payload = { ...config };
+    for (const field of ERROR_CODE_FIELDS) {
+      if (field.key in payload && !envLocked.includes(field.key)) {
+        payload[field.key] = parseErrorCodes(payload[field.key]).codes;
+      }
+    }
     setSaving(true);
     try {
-      const res = await api.post("/config/save", { config });
+      const res = await api.post("/config/save", { config: payload });
       setMessage({ type: "success", text: res.data.message || "配置保存成功" });
       // 静默刷新配置（不清空刚显示的弹窗消息）
       await loadConfig({ silent: true });
@@ -341,12 +317,14 @@ export default function Config() {
       );
     }
 
-    if (field.type === "csv_numbers") {
+    if (field.type === "error_codes") {
       return (
-        <CsvNumbersField
+        <ErrorCodesField
+          id={field.key}
           value={value}
           onChange={(v) => setField(field.key, v)}
           placeholder={field.placeholder}
+          emptyHint={field.emptyHint}
         />
       );
     }
@@ -453,13 +431,18 @@ export default function Config() {
         </button>
         <button
           onClick={saveConfig}
-          disabled={saving || loading}
+          disabled={saving || loading || invalidCodeFields.length > 0}
           className="btn btn-primary text-sm flex items-center gap-1.5 disabled:opacity-50"
         >
           {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
           {saving ? "保存中..." : "保存配置"}
         </button>
         </div>
+        {!loading && invalidCodeFields.length > 0 && (
+          <p className="mt-2 text-xs text-red-300" role="status">
+            {invalidCodeFields.map((field) => field.label).join("、")}格式无效，修正后才能保存。
+          </p>
+        )}
       </div>
 
       {/* 消息弹窗 */}
@@ -505,12 +488,12 @@ export default function Config() {
                   .filter((field) => !field.showIf || field.showIf(config))
                   .map((field) => (
                     <div key={field.key}>
-                      <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                      <label htmlFor={field.key} className="block text-sm font-medium text-gray-300 mb-1.5">
                         {field.label}
                       </label>
                       {renderField(field)}
                       {field.note && (
-                        <p className="text-xs text-gray-500 mt-1.5">{field.note}</p>
+                        <p id={`${field.key}-note`} className="text-xs text-gray-500 mt-1.5">{field.note}</p>
                       )}
                     </div>
                   ))}

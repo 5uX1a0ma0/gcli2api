@@ -197,9 +197,11 @@ def build_antigravity_headers(
     return headers
 
 
-def _is_retryable_status(status_code: int, disable_error_codes: List[int]) -> bool:
-    """统一判断是否属于可重试状态码。"""
-    return status_code in (400, 403, 429, 503) or status_code in disable_error_codes
+def _is_retryable_status(
+    status_code: int, retry_error_codes: List[int], disable_error_codes: List[int]
+) -> bool:
+    """配置的重试码或禁用码均需进入错误处理，由各自的开关决定操作。"""
+    return status_code in retry_error_codes or status_code in disable_error_codes
 
 
 def _is_model_not_found_error(status_code: int) -> bool:
@@ -238,7 +240,7 @@ async def _select_retry_credential(
     model_name: str, session_key: Optional[str], excluded_emails: set[str],
     failed_email: Optional[str] = None,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """400/403 优先换凭证，无替代时有限重试当前凭证；永久禁用仍由选取层过滤。"""
+    """错误后优先换凭证，无替代时有限重试当前凭证；永久禁用由选取层过滤。"""
     if failed_email:
         replacement = await get_valid_credential(
             model_name=model_name, session_key=session_key,
@@ -406,6 +408,7 @@ async def stream_request(
     retry_config = await get_retry_config()
     max_retries = retry_config["max_retries"]
     retry_interval = retry_config["retry_interval"]
+    RETRY_ERROR_CODES = retry_config["retry_error_codes"]
 
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
@@ -513,9 +516,9 @@ async def stream_request(
                         model_not_found = need_retry = True
                         break
 
-                    # 拒绝、限流或配置的自动禁用错误统一走重试流程。
-                    if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
-                        retry_failed_email = current_file if status_code in (400, 403) else None
+                    # 重试与禁用各自按配置处理。
+                    if _is_retryable_status(status_code, RETRY_ERROR_CODES, DISABLE_ERROR_CODES):
+                        retry_failed_email = current_file
                         log.warning(f"[ANTIGRAVITY STREAM] 流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_body[:500] if error_body else '无'}")
 
                         # 解析冷却时间
@@ -526,14 +529,6 @@ async def stream_request(
                             except Exception:
                                 pass
 
-                        # 预热下一个凭证
-                        if next_cred_task is None and retry_config["retry_enabled"] and attempt < max_retries:
-                            next_cred_task = asyncio.create_task(
-                                _select_retry_credential(
-                                    model_name, session_key, excluded_emails, retry_failed_email,
-                                )
-                            )
-
                         # 记录错误并切换凭证
                         await record_api_call_error(current_file, status_code, cooldown_until, model_name=model_name,
                             error_message=error_body
@@ -542,9 +537,17 @@ async def stream_request(
                         await _log_stream_result(status_code, False, error_body[:500] or f"HTTP {status_code}")
 
                         # 检查是否应该重试
-                        should_retry = await handle_error_with_retry(status_code, current_file, retry_config["retry_enabled"], attempt, max_retries, retry_interval)
+                        should_retry = await handle_error_with_retry(
+                            status_code, current_file, retry_config["retry_enabled"],
+                            attempt, max_retries, retry_interval, RETRY_ERROR_CODES,
+                        )
 
                         if should_retry and attempt < max_retries:
+                            # 禁用已写入后再选取，避免预热任务复用刚被禁用的凭证。
+                            if next_cred_task is None:
+                                next_cred_task = asyncio.create_task(_select_retry_credential(
+                                    model_name, session_key, excluded_emails, retry_failed_email,
+                                ))
                             need_retry = True
                             break  # 跳出内层循环，准备重试
                         else:
@@ -553,7 +556,7 @@ async def stream_request(
                             yield chunk
                             return
                     else:
-                        # 错误码不在禁用码当中，直接返回，无需重试
+                        # 未配置的错误码直接返回。
                         log.error(f"[ANTIGRAVITY STREAM] 流式请求失败，非重试错误码 (status={status_code}), 凭证: {current_file}, 响应: {error_body[:500] if error_body else '无'}")
                         await record_api_call_error(current_file, status_code, None, model_name=model_name,
                             error_message=error_body
@@ -593,7 +596,7 @@ async def stream_request(
                 # 本次上游调用（空回复）产生一条日志
                 await _log_stream_result(200, False, "Empty response from API")
 
-                if attempt < max_retries:
+                if retry_config["retry_enabled"] and 500 in RETRY_ERROR_CODES and attempt < max_retries:
                     need_retry = True
                 else:
                     log.error(f"[ANTIGRAVITY STREAM] 空回复达到最大重试次数")
@@ -645,7 +648,8 @@ async def stream_request(
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY STREAM] 流式请求异常: {e}, 凭证: {current_file}")
-            if attempt < max_retries:
+            if (not success_recorded and retry_config["retry_enabled"]
+                    and 500 in RETRY_ERROR_CODES and attempt < max_retries):
                 log.info(f"[ANTIGRAVITY STREAM] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 # 本次上游调用（异常）产生一条日志
                 await _log_stream_result(500, False, f"异常: {e}")
@@ -790,6 +794,7 @@ async def non_stream_request(
     retry_config = await get_retry_config()
     max_retries = retry_config["max_retries"]
     retry_interval = retry_config["retry_interval"]
+    RETRY_ERROR_CODES = retry_config["retry_error_codes"]
 
     DISABLE_ERROR_CODES = await get_auto_ban_error_codes()  # 禁用凭证的错误码
     last_error_response = None  # 记录最后一次的错误响应
@@ -855,7 +860,7 @@ async def non_stream_request(
                     # 本次上游调用（空回复）产生一条日志
                     await _log_result(200, False, error_message="Empty response from API")
                     
-                    if attempt < max_retries:
+                    if retry_config["retry_enabled"] and 500 in RETRY_ERROR_CODES and attempt < max_retries:
                         need_retry = True
                     else:
                         log.error(f"[ANTIGRAVITY] 空回复达到最大重试次数")
@@ -903,8 +908,8 @@ async def non_stream_request(
                         continue
                     return last_error_response
 
-                if _is_retryable_status(status_code, DISABLE_ERROR_CODES):
-                    retry_failed_email = current_file if status_code in (400, 403) else None
+                if _is_retryable_status(status_code, RETRY_ERROR_CODES, DISABLE_ERROR_CODES):
+                    retry_failed_email = current_file
                     log.warning(f"[ANTIGRAVITY] 非流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500] if error_text else '无'}")
 
                     # 解析冷却时间
@@ -915,14 +920,6 @@ async def non_stream_request(
                         except Exception:
                             pass
 
-                    # 并行预热下一个凭证,不阻塞当前处理
-                    if next_cred_task is None and retry_config["retry_enabled"] and attempt < max_retries:
-                        next_cred_task = asyncio.create_task(
-                                _select_retry_credential(
-                                    model_name, session_key, excluded_emails, retry_failed_email,
-                                )
-                            )
-
                     # 记录错误并切换凭证
                     await record_api_call_error(current_file, status_code, cooldown_until, model_name=model_name,
                         error_message=error_text
@@ -931,16 +928,23 @@ async def non_stream_request(
                     await _log_result(status_code, False, error_message=error_text[:500] or f"HTTP {status_code}")
 
                     # 检查是否应该重试
-                    should_retry = await handle_error_with_retry(status_code, current_file, retry_config["retry_enabled"], attempt, max_retries, retry_interval)
+                    should_retry = await handle_error_with_retry(
+                        status_code, current_file, retry_config["retry_enabled"],
+                        attempt, max_retries, retry_interval, RETRY_ERROR_CODES,
+                    )
 
                     if should_retry and attempt < max_retries:
+                        if next_cred_task is None:
+                            next_cred_task = asyncio.create_task(_select_retry_credential(
+                                model_name, session_key, excluded_emails, retry_failed_email,
+                            ))
                         need_retry = True
                     else:
                         # 不重试，直接返回原始错误
                         log.error(f"[ANTIGRAVITY] 达到最大重试次数或不应重试，返回原始错误")
                         return last_error_response
                 else:
-                    # 错误码不在禁用码当中，直接返回，无需重试
+                    # 未配置的错误码直接返回。
                     log.error(f"[ANTIGRAVITY] 非流式请求失败，非重试错误码 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500] if error_text else '无'}")
                     await record_api_call_error(current_file, status_code, None, model_name=model_name,
                         error_message=error_text
@@ -972,7 +976,7 @@ async def non_stream_request(
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY] 非流式请求异常: {e}, 凭证: {current_file}")
-            if attempt < max_retries:
+            if retry_config["retry_enabled"] and 500 in RETRY_ERROR_CODES and attempt < max_retries:
                 log.info(f"[ANTIGRAVITY] 异常后重试 (attempt {attempt + 2}/{max_retries + 1})...")
                 # 本次上游调用（异常）产生一条日志
                 await _log_result(500, False, error_message=f"异常: {e}")
