@@ -96,14 +96,17 @@ async def env(monkeypatch, tmp_path):
     upstream = Upstream()
     monkeypatch.setattr(manager, "get_database", AsyncMock(return_value=database))
     monkeypatch.setattr(panel, "get_database", AsyncMock(return_value=database))
+    monkeypatch.setattr(api, "get_database", lambda: manager.get_database())
+    monkeypatch.setattr(api, "refresh_token", lambda data, email: manager.refresh_token(data, email))
+    api._model_refresh_tasks.clear()
+    api._model_refresh_forced.clear()
+    monkeypatch.setattr(api, "_model_refresh_semaphore", asyncio.Semaphore(8))
     monkeypatch.setattr(api, "post_async", upstream.post)
     monkeypatch.setattr(api, "stream_post_async", upstream.stream)
     for name in ("record_usage_log", "record_api_call_success", "record_api_call_error"):
         monkeypatch.setattr(api, name, AsyncMock())
     monkeypatch.setattr(api, "_record_request_body_detail", AsyncMock(return_value=""))
     manager._reset_sticky()
-    manager._model_cache.clear()
-    manager._model_cache_locks.clear()
     session_cache._memory_store.clear()
 
     async def add(label, models, tier="pro"):
@@ -122,8 +125,6 @@ async def env(monkeypatch, tmp_path):
     yield SimpleNamespace(db=database, upstream=upstream, add=add)
     await database.close()
     manager._reset_sticky()
-    manager._model_cache.clear()
-    manager._model_cache_locks.clear()
     session_cache._memory_store.clear()
 
 
@@ -239,11 +240,11 @@ async def test_capability_query_filters_disabled_but_keeps_zero_quota(env):
         "gemini-4-blocked-info": {"disabled": True},
         "claude-blocked-info": {"isDisabled": True},
     }
-    assert await api.fetch_credential_model_ids("token", "project") == {NEW_CLAUDE}
+    assert await api.fetch_credential_models("token", "project") == [NEW_CLAUDE]
     _, token, payload, options = env.upstream.probes[0]
     assert token == "token" and payload == {"project": "project"}
     assert options["timeout"] == 15
-    await api.fetch_credential_model_ids("token")
+    await api.fetch_credential_models("token")
     assert env.upstream.probes[-1][2] == {}
 
 
@@ -264,22 +265,18 @@ async def test_successful_empty_list_and_missing_model_are_not_selected(env):
 
 async def test_cache_expires_recovers_and_retains_stale_result_on_failure(env, monkeypatch):
     email, data = await env.add("token", [OLD_CLAUDE])
-    now = [0.0]
-    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
     assert await manager.get_credential_model_ids(email, data) == {OLD_CLAUDE}
     env.upstream.models["token"] = {NEW_CLAUDE: {}}
-    now[0] = 299
     assert await manager.get_credential_model_ids(email, data) == {OLD_CLAUDE}
-    now[0] = 301
+    await env.db.update_credential_state(email, {"models_checked_at": time.time() - 301})
     assert await manager.get_credential_model_ids(email, data) == {NEW_CLAUDE}
     env.upstream.models["token"] = None
-    now[0] = 602
+    await env.db.update_credential_state(email, {"models_checked_at": time.time() - 301})
     assert await manager.get_credential_model_ids(email, data) == {NEW_CLAUDE}
-    now[0] = 610
     assert await manager.get_credential_model_ids(email, data) == {NEW_CLAUDE}
     assert len(env.upstream.probes) == 3
     env.upstream.models["token"] = {GEMINI4: {}}
-    now[0] = 633
+    await env.db.update_credential_state(email, {"models_retry_after": time.time() - 1})
     assert await manager.get_credential_model_ids(email, data) == {GEMINI4}
 
 
@@ -293,6 +290,7 @@ async def test_changed_credential_or_endpoint_invalidates_cache(env, field):
     else:
         data[field] = "new"
         env.upstream.models["new"] = {NEW_CLAUDE: {}}
+        await env.db.store_credential(email, data)
     assert await manager.get_credential_model_ids(email, data) == {NEW_CLAUDE}
     assert len(env.upstream.probes) == 2
 
@@ -399,14 +397,12 @@ async def test_panel_reentry_reuses_paid_status_after_cache_expiry_and_restart(e
     ) as client:
         assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is paid
         assert (await env.db.get_credential_state(email))["paid_checked_at"] is not None
-        manager._model_cache[email] = (manager._model_cache[email][0], -1, frozenset(models))
+        await env.db.update_credential_state(email, {"models_checked_at": time.time() - 301})
         assert (await client.get(f"/creds/model-status/{email}")).json()["paid"] is paid
         data["expiry"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         await env.db.store_credential(email, data)
         refresh = AsyncMock(side_effect=RuntimeError("should not refresh a saved Paid result"))
         monkeypatch.setattr(panel.Credentials, "refresh", refresh)
-        manager._model_cache.clear()
-        manager._model_cache_locks.clear()
         await env.db.close()
         await env.db.initialize()
         for _ in range(2):
@@ -431,7 +427,11 @@ async def test_explicit_paid_refresh_updates_saved_status_and_preserves_it_on_fa
         saved = await env.db.get_credential_state(email)
         env.upstream.models["token"] = None
         assert (await client.get(f"/creds/model-status/{email}?refresh=true")).json()["paid"] is False
-        assert await env.db.get_credential_state(email) == saved
+        failed = await env.db.get_credential_state(email)
+        assert failed["paid"] == saved["paid"]
+        assert failed["paid_checked_at"] == saved["paid_checked_at"]
+        assert failed["supported_models"] == saved["supported_models"]
+        assert failed["models_retry_after"] > time.time()
     assert len(env.upstream.probes) == 3
     assert not env.upstream.generated
 
@@ -522,7 +522,7 @@ async def test_model_not_found_switches_once_without_retry_budget_or_auto_ban(en
         "project-first", "project-second",
     ]
     assert all(payload["model"] == NEW_CLAUDE for _, payload in env.upstream.generated)
-    assert first not in manager._model_cache
+    assert NEW_CLAUDE not in (await env.db.get_credential_state(first))["supported_models"]
     assert (await env.db.get_credential_state(first))["disabled"] is False
     assert api.record_api_call_error.await_count == 1
     assert json.loads(api.record_api_call_error.await_args.kwargs["error_message"]) == NOT_FOUND_ERROR
@@ -571,12 +571,11 @@ async def test_model_mismatch_stays_disabled_after_cache_expiry(env, monkeypatch
     first, _ = await env.add("first", [NEW_CLAUDE])
     await env.add("second", [NEW_CLAUDE])
     monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
-    now = [0.0]
-    monkeypatch.setattr(manager, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(stream)
     assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
-    for now[0] in (301, 86400, 86400 * 365):
+    for age in (301, 86400, 86400 * 365):
+        await env.db.update_credential_state(first, {"models_checked_at": time.time() - age})
         assert (await manager.get_valid_credential(NEW_CLAUDE))[0] != first
 
 
@@ -645,8 +644,6 @@ async def test_model_disable_survives_database_and_process_restart(env, monkeypa
     env.upstream.outcomes["first"] = [(404, NOT_FOUND_ERROR)]
     await call_api(stream, body)
     await env.db.close()
-    manager._model_cache.clear()
-    manager._model_cache_locks.clear()
     manager._reset_sticky()
     session_cache._memory_store.clear()
 
@@ -741,7 +738,7 @@ async def test_400_returns_original_error_when_retry_is_disabled(env, stream, me
     result = await call_api(stream)
     assert result.status_code == 400
     assert len(env.upstream.generated) == 1
-    assert email in manager._model_cache
+    assert (await env.db.get_credential_state(email))["models_checked_at"] is not None
     assert await env.db.get_disabled_model_ids(email) == set()
 
 
@@ -783,12 +780,14 @@ async def test_export_import_reuses_token_and_preserves_paid_and_model_disables(
         "expiry": data["expiry"],
         "tier": data["tier"],
         "project_id": data["project_id"],
+        "supported_models": sorted([GEMINI4, FLASH]),
+        "models_checked_at": before_state["models_checked_at"],
     }
 
     result = await panel._import_single_credential(exported)
     assert result["status"] == "success"
     refresh.assert_not_awaited()
-    assert email not in manager._model_cache
+    assert (await env.db.get_credential_state(email))["models_checked_at"] == before_state["models_checked_at"]
     stored = await env.db.get_credential(email)
     assert stored["access_token"] == data["access_token"]
     assert stored["expiry"] == data["expiry"]
@@ -857,7 +856,8 @@ async def test_free_priority_falls_back_when_free_account_is_unavailable(env, mo
         monkeypatch.setattr(manager, "refresh_token", AsyncMock(return_value=None))
     elif reason == "unknown":
         env.upstream.models["free"] = None
-        manager.invalidate_model_cache(free)
+        data["project_id"] = "new-context"
+        await env.db.store_credential(free, data)
     config._config_cache.update({"credential_select_mode": mode, "free_account_priority_enabled": True})
     monkeypatch.setattr(storage.random, "choice", lambda candidates: candidates[0])
     manager._sticky_email = paid
@@ -951,7 +951,7 @@ async def test_original_project_verification_preserves_paid_and_permanent_model_
     assert after["disabled"] is False and after["error_codes"] == []
     assert after["project_id"] == "verified-project" and after["tier"] == "ultra"
     assert after["paid"] is before["paid"] is False
-    assert after["paid_checked_at"] == before["paid_checked_at"]
+    assert after["paid_checked_at"] >= before["paid_checked_at"]
     assert await env.db.get_disabled_model_ids(email) == {FLASH}
     assert not env.upstream.generated
 

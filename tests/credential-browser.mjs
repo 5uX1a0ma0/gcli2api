@@ -15,6 +15,7 @@ const accounts = Array.from({ length: 12 }, (_, index) => ({
   disabled: index === 3, error_codes: index === 3 ? [403] : [], model_cooldowns: {},
   tier: "pro", project_id: "original-project", paid: index % 2 === 0,
   paid_checked_at: Date.now() / 1000,
+  supported_models: ["claude-sonnet-4-6", "gemini-3.8-flash"], models_checked_at: Date.now() / 1000,
 }));
 const settings = {
   free_account_priority_enabled: true, credential_select_mode: "cache",
@@ -25,6 +26,8 @@ let envLocked = [], dedupScenario = "partial";
 const dedupRequests = [];
 let scenario = "partial", active = 0, peak = 0, summaries = 0, empty = false;
 const checks = [], saves = [], unexpected = [], exceptions = [], captures = [];
+const modelChecks = [], paidRefreshes = [];
+let modelScenario = "success", modelActive = 0, modelPeak = 0;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
@@ -83,6 +86,30 @@ const server = http.createServer(async (req, res) => {
       if (current === "partial" && index === 2) return send({ success: false, error: "Project ID 检验失败" });
       Object.assign(accounts[index], { project_id: `verified-${index}`, tier: "ultra", disabled: false, error_codes: [] });
       return send({ success: true, email, project_id: accounts[index].project_id, subscription_tier: "ultra" });
+    }
+    if (url.pathname.startsWith("/creds/refresh-models/")) {
+      assert.equal(req.method, "POST");
+      const email = decodeURIComponent(url.pathname.slice("/creds/refresh-models/".length));
+      const account = accounts.find((item) => item.email === email); assert(account);
+      const current = modelScenario;
+      modelChecks.push(email); modelPeak = Math.max(modelPeak, ++modelActive);
+      await delay(current === "batch" ? 650 : 250); modelActive--;
+      if (current === "failure" || (current === "batch" && email === "account-1@example.test")) {
+        return send({ detail: "刷新模型失败，请重试" }, 503);
+      }
+      Object.assign(account, {
+        supported_models: current === "empty" ? [] : ["claude-opus-5-5-high", "gemini-4-argon-high",
+          "gemini-very-long-upstream-model-identifier-with-many-characters-for-mobile-overflow-verification"],
+        models_checked_at: Date.now() / 1000, paid: true, paid_checked_at: Date.now() / 1000,
+      });
+      return send({ success: true, email, supported_models: account.supported_models,
+        models_checked_at: account.models_checked_at, paid: account.paid, count: account.supported_models.length });
+    }
+    if (url.pathname.startsWith("/creds/model-status/") && url.searchParams.get("refresh") === "true") {
+      const email = decodeURIComponent(url.pathname.slice("/creds/model-status/".length));
+      const account = accounts.find((item) => item.email === email); assert(account);
+      paidRefreshes.push(email); account.paid = !account.paid; account.paid_checked_at = Date.now() / 1000;
+      return send({ email, paid: account.paid });
     }
     if (url.pathname.startsWith("/creds/test/") || url.pathname.startsWith("/creds/model-status/")) {
       unexpected.push(url.pathname); return send({ detail: "Unexpected model request" }, 500);
@@ -155,7 +182,38 @@ try {
   await viewport(1440, 1000); await cdp("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/` });
   await waitFor(() => hasText("凭证管理"), "navigation"); await click("凭证管理"); await listReady();
   assert.equal(await evaluate(`${button("批量检验")}.disabled`), true);
-  await capture("desktop-before", true); await select(8); const before = summaries;
+  await capture("desktop-before", true);
+  const openModels = async (index) => {
+    await evaluate(`document.querySelectorAll('button[title="点击查看或刷新该凭证支持的模型列表"]')[${index}].click()`);
+    await waitFor(() => evaluate("!!document.querySelector('[role=dialog]')"), "models dialog");
+  };
+  await openModels(0); assert(await hasText("模型数：2")); assert(await hasText("更新时间："));
+  await capture("desktop-models-before", false, "[role=dialog]");
+  modelScenario = "empty"; await click("刷新模型列表");
+  await waitFor(() => hasText("该凭证暂无可用模型。"), "known empty models");
+  assert(await hasText("模型数：0")); assert(await hasText("模型 0"));
+  modelScenario = "failure"; await click("刷新模型列表");
+  await waitFor(() => hasText("刷新模型失败，请重试"), "model refresh failure");
+  assert(await hasText("模型数：0")); await capture("desktop-models-error", false, "[role=dialog]");
+  modelScenario = "success"; await click("刷新模型列表");
+  await waitFor(() => hasText("模型数：3"), "models refreshed");
+  assert(await hasText("claude-opus-5-5-high")); assert.equal(accounts[0].paid, true);
+  await capture("desktop-models-after", false, "[role=dialog]");
+  await click("关闭"); await listReady();
+  await viewport(390, 844, true); await openModels(8);
+  await click("刷新模型列表"); await waitFor(() => hasText("模型数：3"), "mobile models refreshed");
+  assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"), true);
+  await capture("mobile-models", false, "[role=dialog]");
+  await viewport(844, 390, true); await capture("landscape-models", false, "[role=dialog]");
+  assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"), true);
+  assert.equal(await evaluate("(()=>{const rect=document.querySelector('[role=dialog]').getBoundingClientRect();return rect.top>=16&&rect.bottom<=innerHeight-16})()"), true);
+  await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await waitFor(() => evaluate("!document.querySelector('[role=dialog]')"), "keyboard close models");
+  await viewport(1440, 1000); await listReady();
+  await evaluate(`document.querySelector('button[title="点击重新识别 Paid"]').click()`);
+  await waitFor(() => paidRefreshes.length === 1 && accounts[0].paid === false, "Paid refreshed");
+  await listReady();
+  await select(8); const before = summaries;
   await click("批量检验"); await waitFor(() => checks.length === 4, "first workers");
   assert.equal(await evaluate(`${button("刷新状态")}.disabled`), true);
   assert.equal(await evaluate("[...document.querySelectorAll('button[aria-haspopup=listbox]')].every(b=>b.disabled)"), true);
@@ -191,6 +249,22 @@ try {
   await capture("mobile-running"); await waitFor(() => hasText("批量检验完成"), "mobile done"); await click("查看检验结果");
   assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"), true); await capture("mobile-results", true);
   await viewport(844, 390, true); await capture("landscape-results"); assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"), true);
+
+  // Model refresh shares progress, cancellation and mutual exclusion with verification.
+  await viewport(1440, 1000); modelScenario = "batch";
+  await select(12); const beforeModels = modelChecks.length;
+  await click("批量刷新模型"); await waitFor(() => modelChecks.length === beforeModels + 4, "model batch workers");
+  assert.equal(await evaluate(`${button("批量检验")}.disabled`), true);
+  assert.equal(await evaluate(`${button("邮箱去重")}.disabled`), true);
+  await click("停止后续刷新"); await waitFor(() => hasText("批量刷新已停止"), "model batch stopped");
+  assert.equal(modelChecks.length, beforeModels + 4); assert(await hasText("未刷新 8"));
+  await select(12); await click("批量刷新模型");
+  await waitFor(() => hasText("批量刷新完成"), "model batch complete");
+  assert(await hasText("成功 11")); assert(await hasText("失败 1"));
+  await click("查看刷新结果"); assert(await hasText("刷新模型失败，请重试"));
+  assert.equal(modelPeak, 4); await capture("desktop-model-batch-results");
+  await viewport(390, 844, true); await capture("mobile-model-batch-results");
+  assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"), true);
 
   // All error-code fields preserve invalid drafts, block save, and normalize valid input.
   await viewport(1440, 1000); await click("配置管理");
@@ -296,8 +370,8 @@ try {
   empty = true; await click("刷新状态"); await waitFor(() => hasText("没有凭证"), "empty list");
   assert.deepEqual(unexpected, []); assert.deepEqual(exceptions, []);
   const report = { passed: true, checked: checks.length, peakConcurrency: peak, summaries,
-    configSaves: saves.length, deduplicationRequests: dedupRequests.length, captures,
-    states: ["selected", "running", "partial failure", "stopped", "unmount", "saved setting", "keyboard", "mobile", "landscape", "reduced motion", "empty",
+    configSaves: saves.length, modelRefreshes: modelChecks.length, modelPeak, paidRefreshes: paidRefreshes.length, deduplicationRequests: dedupRequests.length, captures,
+    states: ["model list", "model empty", "model failure", "model refresh", "model long names", "Paid refresh", "model batch stop", "model batch partial failure", "selected", "running", "partial failure", "stopped", "unmount", "saved setting", "keyboard", "mobile", "landscape", "reduced motion", "empty",
       "invalid code drafts", "normalized code save", "empty codes", "environment lock",
       "selected deduplication", "changed selection", "all deduplication", "dedup preview", "conflict", "scan cancellation", "scan error", "no duplicates", "cleanup"] };
   await writeFile(path.join(output, "report.json"), JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2));

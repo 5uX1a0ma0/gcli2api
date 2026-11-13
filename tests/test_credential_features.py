@@ -1,6 +1,7 @@
 """实际邮箱去重与错误码配置的离线回归测试。"""
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -222,6 +223,12 @@ async def test_deduplication_preserves_winner_state_and_merges_account_restricti
     await feature_env.db.update_credential_state(alias, {
         "model_cooldowns": {"gemini": until + 500, "claude_gpt": until + 1000},
     })
+    for email, model in ((owner, "gemini-winner"), (alias, "gemini-other-token")):
+        snapshot = await feature_env.db.get_credential_models_info(email)
+        await feature_env.db.update_credential_state(email, {
+            "supported_models": [model], "models_checked_at": time.time(),
+            "models_context": snapshot["models_context"],
+        })
     await feature_env.db.disable_credential_model(owner, "model-one")
     await feature_env.db.disable_credential_model(alias, "model-two")
     await feature_env.db.insert_usage_log({"credential_email": alias, "status_code": 200})
@@ -239,6 +246,12 @@ async def test_deduplication_preserves_winner_state_and_merges_account_restricti
     assert after["model_cooldowns"] == {"gemini": until + 500, "claude_gpt": until + 1000}
     assert await feature_env.db.get_disabled_model_ids(owner) == {"model-one", "model-two"}
     assert (await feature_env.db.get_credential(owner))["access_token"] == f"verified:refresh:{owner}"
+    assert after["models_checked_at"] is None and after["supported_models"] is None
+    async with feature_env.db.session() as session:
+        raw_models = await session.scalar(storage.select(storage.AntigravityCredential.supported_models).where(
+            storage.AntigravityCredential.email == owner,
+        ))
+    assert json.loads(raw_models) == ["gemini-winner"]
     logs, total = await feature_env.db.query_usage_logs()
     assert total == 1 and logs[0]["credential_email"] == alias
 

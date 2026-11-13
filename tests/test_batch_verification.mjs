@@ -53,3 +53,20 @@ test("stopping prevents further checks while keeping results of active checks", 
   assert.equal(results.length, 4);
   assert.ok(results.every((result) => result.success));
 });
+
+test("model refresh keeps empty successes and capability metadata", async () => {
+  const results = await runBatchVerification(["empty", "paid"], {
+    verify: async (email) => ({
+      success: true,
+      supported_models: email === "empty" ? [] : ["claude-opus-5-5-high"],
+      models_checked_at: 1234,
+      paid: email === "paid" ? true : null,
+    }),
+  });
+  assert.deepEqual(results[0].supported_models, []);
+  assert.equal(results[0].success, true);
+  assert.equal(results[0].models_checked_at, 1234);
+  assert.equal(results[0].paid, null);
+  assert.equal(results[1].supported_models.length, 1);
+  assert.equal(results[1].paid, true);
+});

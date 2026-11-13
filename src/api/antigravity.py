@@ -27,9 +27,14 @@ from src.credential_manager import (
     get_available_model_ids,
     get_valid_credential,
     mark_credential_model_unavailable,
+    get_model_paid_status,
+    refresh_token,
+    should_refresh_token,
 )
 from src.httpx_client import stream_post_async, post_async
+from src.converter.antigravity_fix import resolve_profile
 from src.models import Model, model_to_dict
+from src.storage.database import get_database
 from src.utils import ANTIGRAVITY_USER_AGENT
 from src.session_cache import derive_session_key
 from src.usage_log import (
@@ -345,7 +350,7 @@ async def stream_request(
     Yields:
         Response对象（错误时）或 bytes流/str流（成功时）
     """
-    model_name = body.get("model", "")
+    model_name = resolve_profile(body.get("model", "")).upstream
 
     # 请求日志：开始时间与基础条目（成功/失败均会记录一次）
     log_entry = _base_log_entry(model_name, "", True, log_ctx)
@@ -495,6 +500,10 @@ async def stream_request(
                 # 判断是否是Response对象
                 if isinstance(chunk, Response):
                     status_code = chunk.status_code
+                    if success_recorded:
+                        await _log_stream_result(status_code, False, "Stream interrupted")
+                        yield chunk
+                        return
                     last_error_response = chunk  # 记录最后一次错误
 
                     # 缓存错误解析结果,避免重复decode
@@ -700,7 +709,7 @@ async def non_stream_request(
     Returns:
         Response对象
     """
-    model_name = body.get("model", "")
+    model_name = resolve_profile(body.get("model", "")).upstream
 
     # 请求日志：开始时间与基础条目（成功/失败均会记录一次）
     log_entry = _base_log_entry(model_name, "", False, log_ctx)
@@ -1023,9 +1032,9 @@ def _is_listable_model(model_id: str) -> bool:
     return any(family in lowered for family in _MODEL_FAMILY_WHITELIST)
 
 
-async def fetch_credential_model_ids(
+async def fetch_credential_models(
     access_token: str, project_id: str = "", api_url: Optional[str] = None
-) -> Optional[frozenset[str]]:
+) -> Optional[List[str]]:
     """查询指定凭证的真实模型能力；失败返回 None，成功的空列表仍为空集合。"""
     if not access_token:
         return None
@@ -1045,7 +1054,7 @@ async def fetch_credential_model_ids(
         if not isinstance(models, dict):
             log.warning("[ANTIGRAVITY] 模型能力响应缺少 models 字典")
             return None
-        return frozenset(
+        return sorted(
             model_id for model_id, info in models.items()
             if isinstance(model_id, str) and "disabled" not in model_id.lower()
             and not (isinstance(info, dict) and (
@@ -1055,6 +1064,77 @@ async def fetch_credential_model_ids(
     except Exception as e:
         log.error(f"[ANTIGRAVITY] Failed to fetch models: {e}")
         return None
+
+
+# 只管理正在运行的刷新任务，不保存模型能力结果。
+_model_refresh_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+_model_refresh_forced: set[Tuple[str, str]] = set()
+_model_refresh_semaphore = asyncio.Semaphore(8)
+
+
+async def refresh_credential_models(
+    email: str, credential_data: Optional[Dict[str, Any]] = None,
+    *, force: bool = True, api_url: Optional[str] = None,
+) -> Optional[List[str]]:
+    """统一 token 校验、能力查询、过滤、落库和 Paid 更新。"""
+    api_url = api_url or await get_antigravity_api_url()
+    database = await get_database()
+    snapshot = await database.get_credential_models_info(email, api_url)
+    if snapshot is None:
+        return None
+    key = (email, snapshot["models_context"])
+    task = _model_refresh_tasks.get(key)
+    if task is not None and task.done():
+        _finish_model_refresh(key, task)
+        task = None
+    if force:
+        _model_refresh_forced.add(key)
+    if task is None:
+        task = asyncio.create_task(_refresh_credential_models(email, database, api_url, key))
+        _model_refresh_tasks[key] = task
+        task.add_done_callback(lambda completed: _finish_model_refresh(key, completed))
+    return await asyncio.shield(task)
+
+
+def _finish_model_refresh(key, completed):
+    if _model_refresh_tasks.get(key) is completed:
+        _model_refresh_tasks.pop(key, None)
+        _model_refresh_forced.discard(key)
+
+
+async def _refresh_credential_models(email, database, api_url: str, key):
+    async with _model_refresh_semaphore:
+        # 排队后重读数据库，复用其他进程刚写入的结果。
+        snapshot = await database.get_credential_models_info(email, api_url)
+        if snapshot is None:
+            return None
+        credential_data = snapshot["credential_data"]
+        force = key in _model_refresh_forced
+        if not force and not snapshot["needs_refresh"] and not await should_refresh_token(credential_data):
+            return snapshot["supported_models"]
+        if not force and snapshot["models_retry_after"] and snapshot["models_retry_after"] > time.time():
+            return None
+        if await should_refresh_token(credential_data):
+            credential_data = await refresh_token(dict(credential_data), email)
+            if credential_data is None:
+                await database.save_credential_models(email, snapshot, None, None)
+                return None
+            snapshot = await database.get_credential_models_info(email, api_url)
+            if snapshot is None:
+                return None
+            credential_data = snapshot["credential_data"]
+        models = await fetch_credential_models(
+            credential_data["access_token"], credential_data["project_id"], api_url,
+        )
+        # API 配置在请求期间变化时，不写入旧端点的结果。
+        if api_url != await get_antigravity_api_url():
+            return None
+        if not await database.save_credential_models(email, snapshot, models, get_model_paid_status(models)):
+            return None
+        if models is None:
+            return None
+        info = await database.get_credential_models_info(email, api_url)
+        return info["supported_models"] if info else None
 
 
 async def fetch_available_models() -> List[Dict[str, Any]]:

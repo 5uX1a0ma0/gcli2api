@@ -1,7 +1,7 @@
 """
 数据库层（SQLAlchemy 2.0 异步 ORM）
 统一支持 SQLite（默认）与 PostgreSQL。
-凭证以 email 为唯一键；schema 变更不做旧数据兼容（新表直接重建）。
+凭证以 email 为唯一键；schema 通过补列迁移保留已有数据。
 """
 
 import asyncio
@@ -11,7 +11,7 @@ import os
 import random
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import (
     Boolean,
@@ -65,6 +65,12 @@ class AntigravityCredential(Base):
 
     # 模型级冷却 (JSON: {model_name: cooldown_timestamp})
     model_cooldowns: Mapped[str] = mapped_column(Text, default="{}")
+
+    # 真实上游模型列表；检查时间区分未知能力与成功的空列表
+    supported_models: Mapped[str] = mapped_column(Text, default="[]")
+    models_checked_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    models_context: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    models_retry_after: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # tier 状态 (free/pro/ultra)
     tier: Mapped[Optional[str]] = mapped_column(String(32), default="pro")
@@ -202,6 +208,52 @@ def get_cooldown_group(model_name: str) -> str:
     if "claude" in lowered or "gpt" in lowered:
         return "claude_gpt"
     return model_name
+
+
+MODEL_CAPABILITY_TTL = 300.0
+MODEL_FAILURE_BACKOFF = 30.0
+
+
+def credential_models_context(api_url: str, credential_data: Dict[str, Any]) -> str:
+    """能力仅属于同一 API/project/token 上下文；散列不会包含可读令牌。"""
+    return hashlib.sha256(_dump_json([
+        api_url, credential_data.get("project_id") or "",
+        credential_data.get("access_token") or credential_data.get("token") or "",
+    ]).encode("utf-8")).hexdigest()
+
+
+async def _models_api_url(api_url: Optional[str] = None) -> str:
+    if api_url is not None:
+        return api_url
+    # config 在模块初始化时导入数据库，存在循环依赖，延迟导入。
+    from config import get_antigravity_api_url
+    return await get_antigravity_api_url()
+
+
+def _models_info(row, api_url: str, disabled_models=frozenset()) -> Dict[str, Any]:
+    context = credential_models_context(api_url, {"access_token": row.access_token, "project_id": row.project_id})
+    same_context = row.models_context == context
+    models = _load_json(row.supported_models, [])
+    known = same_context and row.models_checked_at is not None and isinstance(models, list)
+    effective = sorted({m for m in models if isinstance(m, str) and m} - disabled_models) if known else None
+    now = time.time()
+    fresh = known and now < row.models_checked_at + MODEL_CAPABILITY_TTL
+    backoff = same_context and row.models_retry_after is not None and now < row.models_retry_after
+    return {
+        "supported_models": effective,
+        "models_checked_at": row.models_checked_at if known else None,
+        "models_context": context,
+        "models_retry_after": row.models_retry_after if same_context else None,
+        "needs_refresh": not fresh and not backoff,
+    }
+
+
+def _credential_supports_model(info: Dict[str, Any], model_name: Optional[str]) -> Optional[bool]:
+    if not model_name:
+        return True
+    if info["needs_refresh"] or info["supported_models"] is None:
+        return None
+    return model_name in info["supported_models"]
 
 
 # ====================== 数据库管理器 ======================
@@ -371,8 +423,14 @@ class Database:
             expiry_val = credential_data.get("expiry") or ""
             expiry = expiry_val.isoformat() if hasattr(expiry_val, "isoformat") else str(expiry_val)
             tier = credential_data.get("tier")
+            supported_models = credential_data.get("supported_models")
 
             if row:
+                context_changed = row.access_token != access_token or row.project_id != project_id
+                if context_changed:
+                    row.models_context = None
+                    row.models_checked_at = None
+                    row.models_retry_after = None
                 row.access_token = access_token
                 row.refresh_token = refresh_token
                 row.client_id = client_id
@@ -381,6 +439,10 @@ class Database:
                 row.expiry = expiry
                 if tier:
                     row.tier = tier
+                if isinstance(supported_models, list):
+                    # 导入能力只能作为过期缓存，不能覆盖已验证的同上下文结果。
+                    if context_changed or row.models_checked_at is None:
+                        row.supported_models = _dump_json(supported_models)
                 row.updated_at = time.time()
             else:
                 s.add(AntigravityCredential(
@@ -392,10 +454,42 @@ class Database:
                     project_id=project_id,
                     expiry=expiry,
                     tier=tier or "pro",
+                    supported_models=_dump_json(supported_models) if isinstance(supported_models, list) else "[]",
                     last_success=time.time(),
                 ))
             log.debug(f"Stored credential: {email}")
             return True
+
+    async def update_credential_token(self, email: str, previous: Dict[str, Any],
+                                      refreshed: Dict[str, Any]) -> bool:
+        """OAuth 刷新只条件更新令牌，避免旧刷新覆盖刚导入的新凭证。"""
+        values = {"access_token": refreshed["access_token"], "expiry": refreshed["expiry"],
+                  "updated_at": time.time()}
+        if previous["access_token"] != refreshed["access_token"]:
+            values.update(models_context=None, models_checked_at=None, models_retry_after=None)
+        async with self.session() as s:
+            result = await s.execute(AntigravityCredential.__table__.update().where(
+                AntigravityCredential.email == email,
+                AntigravityCredential.access_token == previous["access_token"],
+                AntigravityCredential.refresh_token == previous["refresh_token"],
+                AntigravityCredential.project_id == previous["project_id"],
+            ).values(**values))
+            return result.rowcount == 1
+
+    async def disable_credential_if_current(self, email: str, previous: Dict[str, Any],
+                                            error_code: Optional[int] = None) -> bool:
+        """仅禁用确实失效的凭证上下文，不影响刚重新导入的新令牌。"""
+        values = {"disabled": True, "updated_at": time.time()}
+        if error_code is not None:
+            values.update(error_codes=_dump_json([error_code]), error_messages="{}")
+        async with self.session() as s:
+            result = await s.execute(AntigravityCredential.__table__.update().where(
+                AntigravityCredential.email == email,
+                AntigravityCredential.access_token == previous["access_token"],
+                AntigravityCredential.refresh_token == previous["refresh_token"],
+                AntigravityCredential.project_id == previous["project_id"],
+            ).values(**values))
+            return result.rowcount == 1
 
     async def get_credential(
         self, email: str
@@ -481,10 +575,18 @@ class Database:
                     *[getattr(AntigravityCredential, key) == value
                       for key, value in keep_snapshot["credential_data"].items()],
                 ]
+                capability_updates = {}
+                verified_data = verified[keep_email]["credential_data"]
+                if any(verified_data[key] != keep_snapshot["credential_data"][key]
+                       for key in ("access_token", "project_id")):
+                    capability_updates = {
+                        "models_context": None, "models_checked_at": None, "models_retry_after": None,
+                    }
                 # 条件更新也为 SQLite 获取写锁，防止核对之后保留项被并发删除/覆盖。
                 result = await s.execute(
                     AntigravityCredential.__table__.update().where(*conditions).values(
                         **verified[keep_email]["credential_data"],
+                        **capability_updates,
                         model_cooldowns=_dump_json(cooldowns),
                         updated_at=time.time(),
                     )
@@ -519,79 +621,120 @@ class Database:
 
     async def get_next_available_credential(
         self, model_name: Optional[str] = None, excluded_emails: Optional[set[str]] = None,
-        exclude_paid: bool = False,
+        exclude_paid: bool = False, api_url: Optional[str] = None,
+        exclude_emails: Optional[Set[str]] = None,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """随机获取一个可用凭证（负载均衡 + 模型家族级冷却过滤），返回 (email, credential)"""
-        current_time = time.time()
+        """先过滤禁用、冷却和永久禁用，再优先明确支持模型的凭证。"""
+        api_url = await _models_api_url(api_url)
+        excluded = set(excluded_emails or ()) | set(exclude_emails or ())
         cd_group = get_cooldown_group(model_name) if model_name else None
         async with self.session() as s:
-            # 轻量查询：只取必要的小字段（email/冷却/禁用），避免全表加载
-            # access_token/refresh_token 等大字段（凭证明文可达数 KB）
-            query = select(
-                AntigravityCredential.email,
-                AntigravityCredential.model_cooldowns,
-                AntigravityCredential.paid,
-            ).where(AntigravityCredential.disabled == False)  # noqa: E712
+            # 仅读取上下文与路由所需字段，不加载 refresh token 等凭证明文。
+            rows = (await s.execute(select(
+                AntigravityCredential.email, AntigravityCredential.model_cooldowns,
+                AntigravityCredential.paid, AntigravityCredential.supported_models,
+                AntigravityCredential.models_checked_at, AntigravityCredential.models_context,
+                AntigravityCredential.models_retry_after, AntigravityCredential.access_token,
+                AntigravityCredential.project_id,
+            ).where(AntigravityCredential.disabled.is_(False)).order_by(AntigravityCredential.id))).all()
+            banned_emails = set(await s.scalars(select(DisabledCredentialModel.email).where(
+                DisabledCredentialModel.model_name == model_name,
+            ))) if model_name else set()
+            matched, unknown = [], []
+            for row in rows:
+                if row.email in excluded or row.email in banned_emails:
+                    continue
+                if cd_group and _load_json(row.model_cooldowns, {}).get(cd_group, 0) > time.time():
+                    continue
+                info = _models_info(row, api_url)
+                if exclude_paid and row.paid is True and not info["needs_refresh"]:
+                    continue
+                support = _credential_supports_model(info, model_name)
+                if support is True:
+                    matched.append(row)
+                elif support is None:
+                    unknown.append(row)
+            pool = matched or unknown
             if exclude_paid:
-                # 未识别的凭证也参与探测，冷启动时即可发现可用免费账户。
-                query = query.where(AntigravityCredential.paid.is_not(True))
-            rows = (await s.execute(query.order_by(AntigravityCredential.id))).all()
-            if excluded_emails:
-                rows = [row for row in rows if row.email not in excluded_emails]
-            if not rows:
+                pool = [row for row in pool if row.paid is False] or pool
+            if not pool:
                 return None
-            # Python 侧随机负载均衡（过滤模型家族冷却）
-            candidates = rows
-            if cd_group:
-                candidates = []
-                for candidate in rows:
-                    cooldowns = _load_json(candidate.model_cooldowns, {})
-                    cd = cooldowns.get(cd_group)
-                    if cd is not None and current_time < cd:
-                        continue
-                    candidates.append(candidate)
-            if not candidates:
-                return None
-            if exclude_paid:
-                known_free = [candidate for candidate in candidates if candidate.paid is False]
-                if known_free:
-                    candidates = known_free
-            picked_email = random.choice(candidates)[0]
-            # 只取被选中凭证的完整数据
-            row = await s.scalar(
-                select(AntigravityCredential).where(
-                    AntigravityCredential.email == picked_email
-                )
-            )
-            if not row or row.disabled:
-                return None
-            return row.email, _row_to_credential_dict(row)
+            picked_email = random.choice(pool)[0]
+            row = await s.scalar(select(AntigravityCredential).where(
+                AntigravityCredential.email == picked_email,
+            ))
+            return (row.email, _row_to_credential_dict(row)) if row and not row.disabled else None
 
     async def get_available_credential_by_email(
         self, email: str, model_name: Optional[str] = None, exclude_paid: bool = False,
+        api_url: Optional[str] = None, exclude_emails: Optional[Set[str]] = None,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """
-        按指定 email 获取可用凭证（凭证亲和/粘性模式使用）。
-        凭证不存在/被禁用/该模型家族冷却中 -> None。
-        """
-        if not email:
+        api_url = await _models_api_url(api_url)
+        if not email or email in (exclude_emails or ()):
             return None
-        current_time = time.time()
-        cd_group = get_cooldown_group(model_name) if model_name else None
         async with self.session() as s:
-            row = await s.scalar(
-                select(AntigravityCredential).where(AntigravityCredential.email == email)
-            )
+            row = await s.scalar(select(AntigravityCredential).where(AntigravityCredential.email == email))
             if not row or row.disabled:
                 return None
-            if exclude_paid and row.paid is True:
-                return None
-            if cd_group:
-                cooldowns = _load_json(row.model_cooldowns, {})
-                cd = cooldowns.get(cd_group)
-                if cd is not None and current_time < cd:
+            if model_name:
+                banned = await s.scalar(select(DisabledCredentialModel.model_name).where(
+                    DisabledCredentialModel.email == email, DisabledCredentialModel.model_name == model_name,
+                ))
+                cd_group = get_cooldown_group(model_name)
+                if banned or _load_json(row.model_cooldowns, {}).get(cd_group, 0) > time.time():
                     return None
+            info = _models_info(row, api_url)
+            if exclude_paid and row.paid is True and not info["needs_refresh"]:
+                return None
+            if _credential_supports_model(info, model_name) is False:
+                return None
             return row.email, _row_to_credential_dict(row)
+
+    async def get_credential_models_info(self, email: str, api_url: Optional[str] = None):
+        """返回数据库能力和刷新快照，包含成功空列表。"""
+        api_url = await _models_api_url(api_url)
+        async with self.session() as s:
+            row = await s.scalar(select(AntigravityCredential).where(AntigravityCredential.email == email))
+            if row is None:
+                return None
+            disabled = frozenset(await s.scalars(select(DisabledCredentialModel.model_name).where(
+                DisabledCredentialModel.email == email,
+            )))
+            return {
+                **_models_info(row, api_url, disabled),
+                "credential_data": _row_to_credential_dict(row),
+                "id": row.id, "created_at": row.created_at,
+                "stored_models_checked_at": row.models_checked_at,
+            }
+
+    async def save_credential_models(self, email: str, snapshot: Dict[str, Any],
+                                     models: Optional[List[str]], paid: Optional[bool]) -> bool:
+        """条件更新防止旧 token/project 的探测覆盖新凭证；失败保留 Paid 和同上下文能力。"""
+        data = snapshot["credential_data"]
+        now = time.time()
+        values = {
+            "models_context": snapshot["models_context"],
+            "models_retry_after": now + MODEL_FAILURE_BACKOFF if models is None else None,
+            "updated_at": now,
+        }
+        if models is not None:
+            values.update(supported_models=_dump_json(models), models_checked_at=now,
+                          paid=paid, paid_checked_at=now)
+        else:
+            # 不同 API 上下文的旧能力不能伪装为当前上下文的成功结果。
+            values["models_checked_at"] = snapshot["models_checked_at"]
+        async with self.session() as s:
+            conditions = [
+                AntigravityCredential.email == email, AntigravityCredential.id == snapshot["id"],
+                AntigravityCredential.created_at == snapshot["created_at"],
+                AntigravityCredential.access_token == data["access_token"],
+                AntigravityCredential.project_id == data["project_id"],
+            ]
+            if models is None:
+                # 其他进程刚查到的成功能力和 Paid 不能被更早的失败覆盖。
+                conditions.append(AntigravityCredential.models_checked_at == snapshot["stored_models_checked_at"])
+            result = await s.execute(AntigravityCredential.__table__.update().where(*conditions).values(**values))
+            return result.rowcount == 1
 
     # ---------- 状态管理 ----------
 
@@ -599,9 +742,9 @@ class Database:
         self, email: str, state_updates: Dict[str, Any]
     ) -> bool:
         """更新凭证状态字段"""
-        json_fields = {"error_codes", "error_messages", "model_cooldowns"}
-        float_fields = {"last_success", "paid_checked_at"}
-        str_fields = {"user_email", "tier", "project_id"}
+        json_fields = {"error_codes", "error_messages", "model_cooldowns", "supported_models"}
+        float_fields = {"last_success", "paid_checked_at", "models_checked_at", "models_retry_after"}
+        str_fields = {"tier", "project_id", "models_context"}
         bool_fields = {"disabled"}
         async with self.session() as s:
             values: Dict[str, Any] = {}
@@ -618,6 +761,12 @@ class Database:
                     values[key] = bool(value)
             if not values:
                 return True
+            if "project_id" in values:
+                current_project = await s.scalar(select(AntigravityCredential.project_id).where(
+                    AntigravityCredential.email == email,
+                ))
+                if values["project_id"] != current_project:
+                    values.update(models_context=None, models_checked_at=None, models_retry_after=None)
             values["updated_at"] = time.time()
             result = await s.execute(
                 AntigravityCredential.__table__.update()
@@ -630,13 +779,18 @@ class Database:
         self, email: str
     ) -> Dict[str, Any]:
         """获取凭证状态（不含 error_messages）"""
+        api_url = await _models_api_url()
         async with self.session() as s:
             row = await s.scalar(
                 select(AntigravityCredential).where(AntigravityCredential.email == email)
             )
             if not row:
                 return {}
+            disabled_models = frozenset(await s.scalars(select(DisabledCredentialModel.model_name).where(
+                DisabledCredentialModel.email == email,
+            )))
             return {
+                **_models_info(row, api_url, disabled_models),
                 "disabled": bool(row.disabled),
                 "error_codes": _load_json(row.error_codes, []),
                 "last_success": row.last_success or time.time(),
@@ -650,14 +804,21 @@ class Database:
 
     async def get_all_credential_states(self) -> Dict[str, Dict[str, Any]]:
         """获取所有凭证状态（自动过滤过期CD）"""
+        api_url = await _models_api_url()
         current_time = time.time()
         async with self.session() as s:
             rows = (await s.scalars(select(AntigravityCredential))).all()
+            bans = (await s.execute(select(DisabledCredentialModel.email, DisabledCredentialModel.model_name))).all()
+            disabled_by_email = {}
+            for email, model in bans:
+                disabled_by_email.setdefault(email, set()).add(model)
             states = {}
             for row in rows:
                 cooldowns = _load_json(row.model_cooldowns, {})
                 cooldowns = {k: v for k, v in cooldowns.items() if v > current_time}
                 states[row.email] = {
+                    **_models_info(row, api_url, disabled_by_email.get(row.email, set())),
+                    "paid": row.paid, "paid_checked_at": row.paid_checked_at,
                     "disabled": bool(row.disabled),
                     "error_codes": _load_json(row.error_codes, []),
                     "last_success": row.last_success or time.time(),
@@ -667,6 +828,18 @@ class Database:
                     "project_id": row.project_id or "",
                 }
             return states
+
+    async def get_enabled_credentials_models_info(self) -> Tuple[List[str], List[str]]:
+        """返回有效能力并集和需要按需刷新的启用凭证；冷却不影响展示。"""
+        states = await self.get_all_credential_states()
+        models, refresh = set(), []
+        for email, state in states.items():
+            if state["disabled"]:
+                continue
+            models.update(state["supported_models"] or [])
+            if state["needs_refresh"]:
+                refresh.append(email)
+        return sorted(models), refresh
 
     async def get_credentials_summary(
         self,
@@ -679,6 +852,7 @@ class Database:
         paid_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """凭证摘要（分页 + 状态筛选，内存过滤）"""
+        api_url = await _models_api_url()
         current_time = time.time()
         async with self.session() as s:
             total = await s.scalar(select(func.count()).select_from(AntigravityCredential)) or 0
@@ -707,6 +881,10 @@ class Database:
                     except ValueError:
                         filter_int = None
 
+            bans = (await s.execute(select(DisabledCredentialModel.email, DisabledCredentialModel.model_name))).all()
+            disabled_by_email = {}
+            for email, model in bans:
+                disabled_by_email.setdefault(email, set()).add(model)
             summaries = []
             for row in rows:
                 error_codes = _load_json(row.error_codes, [])
@@ -737,12 +915,15 @@ class Database:
                     if not match:
                         continue
 
+                info = _models_info(row, api_url, disabled_by_email.get(row.email, set()))
                 summary = {
                     "email": row.email,
                     "disabled": bool(row.disabled),
                     "error_codes": error_codes,
                     "last_success": row.last_success or current_time,
                     "model_cooldowns": active_cooldowns,
+                    "supported_models": info["supported_models"],
+                    "models_checked_at": info["models_checked_at"],
                     "tier": row.tier or "pro",
                     "project_id": row.project_id or "",
                     "paid": row.paid,

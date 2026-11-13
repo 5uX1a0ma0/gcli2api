@@ -25,6 +25,9 @@ export async function runBatchVerification(emails, {
           success: data.success === true,
           project_id: data.project_id || "",
           subscription_tier: data.subscription_tier || "",
+          supported_models: data.supported_models,
+          models_checked_at: data.models_checked_at,
+          paid: data.paid,
           message: messageText(data.message || data.error, data.success ? "检验成功" : "检验失败"),
         };
       } catch (error) {

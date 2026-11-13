@@ -18,6 +18,7 @@ import oauthlib.oauth2.rfc6749.parameters
 from config import get_config_value, get_antigravity_api_url, get_panel_password
 from log import log
 
+from .api.antigravity import refresh_credential_models
 from .google_oauth_api import (
     Credentials,
     Flow,
@@ -404,6 +405,12 @@ async def _save_antigravity_credential(
         log.info(f"凭证已保存: {email} (tier={subscription_tier})")
     except Exception as e:
         log.warning(f"创建默认状态记录失败 {email}: {e}")
+
+    # 能力探测失败不影响已经保存的 OAuth 凭证。
+    try:
+        await refresh_credential_models(email, force=True)
+    except Exception as e:
+        log.warning(f"获取凭证 {email} 模型列表失败: {e}")
 
     # 清理使用过的流程
     _cleanup_auth_flow_server(state)

@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Clock,
+  Cpu,
   Download,
   Loader2,
   Mail,
@@ -43,12 +44,14 @@ export default function Credentials() {
   const [quotaModal, setQuotaModal] = useState(null); // { email } 额度弹窗
   const [quotaCache, setQuotaCache] = useState({}); // 缓存额度数据 { email: { claude, gemini } | { error } }
   const [modelStatuses, setModelStatuses] = useState({});
+  const [modelsModal, setModelsModal] = useState(null);
   const [batchVerification, setBatchVerification] = useState(null);
   const [batchDetailsOpen, setBatchDetailsOpen] = useState(false);
   const [deduplicationOpen, setDeduplicationOpen] = useState(false);
   const [deduplicationBusy, setDeduplicationBusyState] = useState(false);
   const batchJobRef = useRef(null);
   const batchRunning = !!batchVerification?.running || deduplicationBusy;
+  const batchVerb = batchVerification?.action === "refresh_models" ? "刷新" : "检验";
 
   const setDeduplicationBusy = useCallback((busy) => {
     setDeduplicationBusyState(busy);
@@ -196,9 +199,12 @@ export default function Credentials() {
     try {
       const res = await api.post(`/creds/verify-project/${encodeURIComponent(email)}`);
       if (res.data.success) {
+        const modelCount = Array.isArray(res.data.supported_models)
+          ? res.data.supported_models.length
+          : 0;
         showMessage(
           "success",
-          `Project=${res.data.project_id}, Tier=${res.data.subscription_tier}`,
+          `Project=${res.data.project_id}, Tier=${res.data.subscription_tier}, 模型数=${modelCount}`,
           `检验成功: ${email}`
         );
       } else {
@@ -216,7 +222,26 @@ export default function Credentials() {
     }
   };
 
-  const verifySelectedProjects = async () => {
+  const refreshCredentialModels = async (email) => {
+    if (batchRunning || busyFiles.has(email)) return;
+    setBusy(email, true);
+    setModelsModal((prev) => prev?.email === email ? { ...prev, error: null } : prev);
+    try {
+      const { data } = await api.post(`/creds/refresh-models/${encodeURIComponent(email)}`);
+      setModelsModal((prev) => prev?.email === email ? {
+        email, models: data.supported_models, checkedAt: data.models_checked_at, paid: data.paid,
+      } : prev);
+      await fetchCreds();
+    } catch (err) {
+      const error = err.response?.data?.detail || "刷新模型列表失败";
+      setModelsModal((prev) => prev?.email === email ? { ...prev, error } : prev);
+    } finally {
+      setBusy(email, false);
+    }
+  };
+
+  const verifySelectedProjects = () => runSelectedBatch("verify_project");
+  const runSelectedBatch = async (action) => {
     if (!selected.size || batchJobRef.current || busyFiles.has("__batch__")) return;
     const emails = Array.from(selected);
     const job = { stop: false, controller: new AbortController() };
@@ -224,7 +249,7 @@ export default function Credentials() {
     setBusy("__batch__", true);
     setBatchDetailsOpen(false);
     setBatchVerification({
-      total: emails.length, completed: 0, success: 0, failed: 0,
+      action, total: emails.length, completed: 0, success: 0, failed: 0,
       running: true, stopping: false, stopped: false, results: [],
     });
     try {
@@ -232,7 +257,8 @@ export default function Credentials() {
         shouldStop: () => job.stop || job.controller.signal.aborted,
         verify: async (email) => {
           if (batchJobRef.current === job) setBusy(email, true);
-          const res = await api.post(`/creds/verify-project/${encodeURIComponent(email)}`, null, {
+          const endpoint = action === "refresh_models" ? "refresh-models" : "verify-project";
+          const res = await api.post(`/creds/${endpoint}/${encodeURIComponent(email)}`, null, {
             signal: job.controller.signal,
           });
           return res.data;
@@ -626,6 +652,14 @@ export default function Credentials() {
               批量检验
             </button>
             <button
+              type="button"
+              onClick={() => runSelectedBatch("refresh_models")}
+              disabled={selected.size === 0 || busyFiles.has("__batch__") || loading || Array.from(selected).some((email) => busyFiles.has(email))}
+              className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 flex items-center justify-center gap-1.5 disabled:opacity-40"
+            >
+              <Cpu size={14} /> 批量刷新模型
+            </button>
+            <button
               onClick={() => doBatchAction("enable")}
               disabled={selected.size === 0 || busyFiles.has("__batch__")}
               className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 disabled:opacity-40"
@@ -680,8 +714,9 @@ export default function Credentials() {
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 text-xs space-y-1" aria-live="polite">
                 <div className="text-gray-200 font-medium">
-                  {batchVerification.running ? (batchVerification.stopping ? "正在停止后续检验" : "正在检验 Project / Tier")
-                    : batchVerification.stopped ? "批量检验已停止" : "批量检验完成"}
+                  {batchVerification.running ? (batchVerification.stopping ? `正在停止后续${batchVerb}`
+                    : batchVerb === "刷新" ? "正在刷新模型列表" : "正在检验 Project / Tier")
+                    : batchVerification.stopped ? `批量${batchVerb}已停止` : `批量${batchVerb}完成`}
                   <span className="text-gray-400 font-normal ml-2 tabular-nums">
                     {batchVerification.completed} / {batchVerification.total}
                   </span>
@@ -689,7 +724,7 @@ export default function Credentials() {
                 <div className="flex flex-wrap gap-x-3 gap-y-1 text-gray-400">
                   <span className="text-emerald-400">成功 {batchVerification.success}</span>
                   <span className={batchVerification.failed ? "text-red-400" : "text-gray-500"}>失败 {batchVerification.failed}</span>
-                  {batchVerification.stopped && <span>未检验 {batchVerification.total - batchVerification.completed}</span>}
+                  {batchVerification.stopped && <span>未{batchVerb} {batchVerification.total - batchVerification.completed}</span>}
                 </div>
               </div>
               {batchVerification.running && (
@@ -699,13 +734,13 @@ export default function Credentials() {
                   disabled={batchVerification.stopping}
                   className="btn btn-secondary text-xs px-3 py-1.5 min-h-10 shrink-0 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
                 >
-                  {batchVerification.stopping ? "等待当前检验" : "停止后续检验"}
+                  {batchVerification.stopping ? `等待当前${batchVerb}` : `停止后续${batchVerb}`}
                 </button>
               )}
             </div>
             <div
               role="progressbar"
-              aria-label="批量 Project / Tier 检验进度"
+              aria-label={batchVerb === "刷新" ? "批量模型刷新进度" : "批量 Project / Tier 检验进度"}
               aria-valuemin={0}
               aria-valuemax={batchVerification.total}
               aria-valuenow={batchVerification.completed}
@@ -725,7 +760,7 @@ export default function Credentials() {
                 className="text-xs text-gray-400 hover:text-white min-h-10 flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-400 rounded-lg"
               >
                 {batchDetailsOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                {batchDetailsOpen ? "收起检验结果" : "查看检验结果"}
+                {batchDetailsOpen ? `收起${batchVerb}结果` : `查看${batchVerb}结果`}
               </button>
             )}
             {batchDetailsOpen && (
@@ -741,7 +776,10 @@ export default function Credentials() {
                       </span>
                     </div>
                     {result.success ? (
-                      <div className="text-gray-400 break-all">Project={result.project_id} · Tier={result.subscription_tier}</div>
+                      <div className="text-gray-400 break-all">
+                        {batchVerb === "刷新" ? `模型数=${result.supported_models?.length ?? 0}`
+                          : `Project=${result.project_id} · Tier=${result.subscription_tier}`}
+                      </div>
                     ) : (
                       <div className="text-red-300 whitespace-pre-wrap break-all">{result.status_code ? `HTTP ${result.status_code} · ` : ""}{result.message}</div>
                     )}
@@ -850,11 +888,31 @@ export default function Credentials() {
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-1 text-gray-500">
-                    <Clock size={12} className="flex-shrink-0" />
-                    <span className="truncate" title={formatTime(cred.last_success)}>
-                      {formatTime(cred.last_success)}
-                    </span>
+                  <div className="flex items-center justify-between gap-2 text-gray-500">
+                    <div className="flex items-center gap-1 min-w-0">
+                      <Clock size={12} className="flex-shrink-0" />
+                      <span className="truncate" title={formatTime(cred.last_success)}>
+                        {formatTime(cred.last_success)}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() =>
+                        setModelsModal({
+                          email: cred.email,
+                          models: cred.supported_models,
+                          checkedAt: cred.models_checked_at,
+                          paid: cred.paid,
+                        })
+                      }
+                      disabled={batchRunning || busy}
+                      className="text-purple-400 hover:text-purple-300 flex items-center gap-1 flex-shrink-0 disabled:opacity-40"
+                      title="点击查看或刷新该凭证支持的模型列表"
+                    >
+                      <Cpu size={12} />
+                      {cred.models_checked_at != null
+                        ? `模型 ${cred.supported_models?.length ?? 0}`
+                        : "模型未检测"}
+                    </button>
                   </div>
                 </div>
 
@@ -953,6 +1011,61 @@ export default function Credentials() {
       )}
 
 
+      {/* 支持模型列表弹窗 */}
+      {modelsModal && (
+        <Modal
+          type="info"
+          title={`支持模型列表 - ${modelsModal.email}`}
+          onClose={() => setModelsModal(null)}
+        >
+          <div className="space-y-3">
+            <div className="text-xs text-gray-400 space-y-1" aria-live="polite">
+              <p>模型数：{modelsModal.checkedAt != null ? modelsModal.models?.length ?? 0 : "未检测"}
+                {modelsModal.paid != null && <span className="ml-3">{modelsModal.paid ? "Paid" : "Non-paid"}</span>}</p>
+              <p>更新时间：{modelsModal.checkedAt != null ? formatTime(modelsModal.checkedAt) : "尚未检测"}</p>
+            </div>
+            {modelsModal.error && <p role="alert" className="text-xs text-red-300 break-all">{modelsModal.error}</p>}
+            {busyFiles.has(modelsModal.email) ? (
+              <div className="flex items-center justify-center py-6 text-gray-500">
+                <RefreshCw size={16} className="animate-spin motion-reduce:animate-none mr-2" />
+                正在获取模型列表...
+              </div>
+            ) : modelsModal.models?.length > 0 ? (
+              <div className="space-y-2">
+                <div className="text-xs text-gray-400">
+                  共支持 {modelsModal.models.length} 个模型：
+                </div>
+                <div className="flex flex-wrap gap-1.5 max-h-60 overflow-y-auto p-2 bg-dark-900/60 border border-dark-700 rounded-lg">
+                  {modelsModal.models.map((m) => (
+                    <span
+                      key={m}
+                      className="text-xs px-2 py-0.5 rounded bg-dark-700 text-gray-200 border border-dark-600 font-mono break-all"
+                    >
+                      {m}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-4 text-gray-500 text-sm">
+                {modelsModal.checkedAt != null ? "该凭证暂无可用模型。" : "尚未记录该凭证的模型列表，请点击下方按钮检测。"}
+              </div>
+            )}
+            <button
+              onClick={() => refreshCredentialModels(modelsModal.email)}
+              disabled={batchRunning || busyFiles.has(modelsModal.email)}
+              className="w-full text-xs text-gray-300 hover:text-white py-2 rounded-lg bg-dark-700 hover:bg-dark-600 flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              <RefreshCw
+                size={12}
+                className={busyFiles.has(modelsModal.email) ? "animate-spin motion-reduce:animate-none" : ""}
+              />
+              刷新模型列表
+            </button>
+          </div>
+        </Modal>
+      )}
+
       {/* 额度弹窗 */}
       {quotaModal && (
         <Modal
@@ -962,7 +1075,7 @@ export default function Credentials() {
         >
           {busyFiles.has(quotaModal.email) ? (
             <div className="flex items-center justify-center py-6 text-gray-500">
-              <RefreshCw size={16} className="animate-spin mr-2" />
+              <RefreshCw size={16} className="animate-spin motion-reduce:animate-none mr-2" />
               加载额度中...
             </div>
           ) : quotaCache[quotaModal.email]?.error ? (

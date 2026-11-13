@@ -9,7 +9,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from log import log
-from src.credential_manager import invalidate_model_cache
 from src.google_oauth_api import Credentials, get_user_email
 from src.models import CredDeduplicateRequest
 from src.storage.database import get_database
@@ -117,9 +116,6 @@ async def deduplicate_credentials(
         except Exception as exc:
             log.error(f"实际邮箱去重失败: {type(exc).__name__}")
             raise HTTPException(status_code=500, detail="邮箱去重失败，请重新扫描后重试") from exc
-        for group in groups:
-            for email in [group["keep_email"], *group["duplicate_emails"]]:
-                invalidate_model_cache(email)
         log.info(f"实际邮箱去重完成: 清理 {len(removed)} 个重复凭证，保留 {len(groups)} 组")
 
     return {

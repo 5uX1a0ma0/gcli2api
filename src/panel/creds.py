@@ -17,9 +17,6 @@ from fastapi.responses import JSONResponse
 from log import log
 from src.credential_manager import (
     add_credential,
-    get_credential_model_ids,
-    get_model_paid_status,
-    invalidate_model_cache,
     remove_credential,
     set_cred_disabled,
 )
@@ -34,7 +31,11 @@ from src.utils import (
     ANTIGRAVITY_CLIENT_ID,
     ANTIGRAVITY_CLIENT_SECRET,
 )
-from src.api.antigravity import fetch_quota_info, build_antigravity_headers
+from src.api.antigravity import (
+    fetch_quota_info,
+    build_antigravity_headers,
+    refresh_credential_models,
+)
 from src.httpx_client import post_async
 from src.google_oauth_api import (
     Credentials,
@@ -134,6 +135,10 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
             log.warning(f"导入凭证 {email}: project_id 获取失败，使用回退值 aicode-consumers")
             project_id = "aicode-consumers"
 
+        # 导入的模型列表不授予路由能力，使用前由统一入口验证。
+        supported_models = data.get("supported_models")
+        supported_models = supported_models if isinstance(supported_models, list) else []
+
         credential_data = {
             "access_token": creds.access_token,
             "refresh_token": refresh_token,
@@ -142,6 +147,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
             "project_id": project_id,
             "expiry": creds.expires_at.isoformat() if creds.expires_at else "",
             "tier": tier,
+            "supported_models": supported_models,
         }
 
         await add_credential(email, credential_data)
@@ -149,6 +155,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
             "status": "success",
             "email": email,
             "tier": tier,
+            "supported_models": supported_models,
             "message": "导入成功",
         }
 
@@ -389,6 +396,8 @@ async def download_all_creds_common() -> Response:
                     "email": email,
                     "tier": state.get("tier", "pro"),
                     "project_id": state.get("project_id", ""),
+                    "supported_models": state.get("supported_models") or [],
+                    "models_checked_at": state.get("models_checked_at"),
                 }
 
                 content = json.dumps(export_data, ensure_ascii=False, indent=2)
@@ -440,32 +449,35 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
         project_id = "aicode-consumers"
 
     # tier 获取失败时保留数据库原值，不覆盖为 None
+    old_state = await database.get_credential_state(email)
     if not subscription_tier:
-        old_state = await database.get_credential_state(email)
         subscription_tier = old_state.get("tier") or "pro"
         log.warning(f"校验凭证 {email}: tier 获取失败，保留原值 {subscription_tier}")
 
     credential_data["project_id"] = project_id
-
     await database.store_credential(email, credential_data)
+    await database.update_credential_state(email, {
+        "disabled": False, "error_codes": [], "tier": subscription_tier,
+    })
+    # 先保存最终 project，再使用统一刷新入口；探测失败不阻断校验。
+    await refresh_credential_models(email, force=True)
+    model_state = await database.get_credential_state(email)
+    supported_models = model_state.get("supported_models") or []
 
-    state_update = {
-        "disabled": False,
-        "error_codes": [],
-        "tier": subscription_tier,
-        "project_id": project_id,
-    }
-
-    await database.update_credential_state(email, state_update)
-
-    log.info(f"检验凭证成功: {email} - Project ID: {project_id}, Tier: {subscription_tier}")
+    log.info(
+        f"检验凭证成功: {email} - Project ID: {project_id}, Tier: {subscription_tier}, "
+        f"Models: {len(supported_models)}"
+    )
 
     return JSONResponse(content={
         "success": True,
         "email": email,
         "project_id": project_id,
         "subscription_tier": subscription_tier,
-        "message": "检验成功！已解除禁用状态并清除错误码",
+        "supported_models": supported_models,
+        "models_checked_at": model_state.get("models_checked_at"),
+        "paid": model_state.get("paid"),
+        "message": "检验成功！已解除禁用状态、清除错误码并同步模型列表",
     })
 
 
@@ -525,22 +537,14 @@ async def get_credential_model_status(
         raise HTTPException(status_code=404, detail="凭证不存在")
 
     state = await database.get_credential_state(email)
-    paid = state.get("paid")
-    if state.get("paid_checked_at") and not refresh:
-        return JSONResponse(content={"email": email, "paid": paid})
+    if (state.get("paid_checked_at") is not None or state.get("paid") is not None) and not refresh:
+        return JSONResponse(content={"email": email, "paid": state.get("paid")})
     try:
-        credentials = Credentials.from_dict(credential_data)
-        if await credentials.refresh_if_needed():
-            credential_data.update(credentials.to_dict())
-            await database.store_credential(email, credential_data)
-        if refresh:
-            invalidate_model_cache(email)
-        model_ids = await get_credential_model_ids(email, credential_data)
-        if model_ids is not None:
-            paid = get_model_paid_status(model_ids)
+        await refresh_credential_models(email, force=refresh)
     except Exception as e:
         log.warning(f"识别凭证模型能力失败 {email}: {e}")
-    return JSONResponse(content={"email": email, "paid": paid})
+    state = await database.get_credential_state(email)
+    return JSONResponse(content={"email": email, "paid": state.get("paid")})
 
 
 @router.post("/action")
@@ -617,6 +621,13 @@ async def creds_batch_action(
                     else:
                         errors.append(f"{email}: 删除失败")
                         continue
+                elif action == "refresh_models":
+                    models = await refresh_credential_models(email, force=True)
+                    if models is not None:
+                        success_count += 1
+                    else:
+                        errors.append(f"{email}: 刷新模型列表失败")
+                        continue
                 else:
                     errors.append(f"{email}: 无效的操作类型")
                     continue
@@ -664,6 +675,8 @@ async def export_credential(
             "email": email,
             "tier": state.get("tier", "pro"),
             "project_id": cred.get("project_id", ""),
+            "supported_models": state.get("supported_models") or [],
+            "models_checked_at": state.get("models_checked_at"),
         }
 
         content = json.dumps(export_data, ensure_ascii=False, indent=2)
@@ -706,6 +719,39 @@ async def verify_credential_project(
     except Exception as e:
         log.error(f"检验凭证失败 {email}: {e}")
         raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
+
+
+@router.post("/refresh-models/{email}")
+async def refresh_cred_models_endpoint(
+    email: str,
+    token: str = Depends(verify_panel_token),
+):
+    """刷新指定凭证支持的模型列表"""
+    try:
+        database = await get_database()
+        cred = await database.get_credential(email)
+        if not cred:
+            raise HTTPException(status_code=404, detail="凭证不存在")
+
+        models = await refresh_credential_models(email, cred, force=True)
+        if models is None:
+            raise HTTPException(status_code=400, detail="获取凭证模型列表失败，请检查凭证是否有效")
+
+        state = await database.get_credential_state(email)
+        return JSONResponse(content={
+            "success": True,
+            "email": email,
+            "models_checked_at": state.get("models_checked_at"),
+            "paid": state.get("paid"),
+            "supported_models": models,
+            "count": len(models),
+            "message": f"成功刷新模型列表（共 {len(models)} 个模型）",
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"刷新凭证模型列表失败 {email}: {e}")
+        raise HTTPException(status_code=500, detail=f"刷新模型列表失败: {str(e)}")
 
 
 @router.get("/errors/{email}")
