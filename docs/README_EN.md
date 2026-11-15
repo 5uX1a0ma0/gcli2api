@@ -341,9 +341,15 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "access
 **Response Behavior Configuration**
 - `RETURN_THOUGHTS_TO_FRONTEND`: Return thinking chain to the frontend (default: true)
 
-**Sensitive Word Filtering**
-- `SENSITIVE_WORDS_ENABLED`: Enable sensitive word filtering (default: false)
-- `SENSITIVE_WORDS`: Sensitive word list, comma or newline separated (default: empty). Matches are replaced with empty string, case-insensitive, Chinese supported, effective immediately after panel save
+**Prompt Identity Rewriting**
+
+- `PROMPT_REWRITE_ENABLED`: Enable client identity rewriting (default for new instances: false)
+- `PROMPT_REWRITE_USE_DEFAULT_KEYWORDS`: Use built-in client names (default: true), including Codex, Claude Code, Claude Agent SDK, and Cursor; replace them with `Antigravity`
+- `PROMPT_REWRITE_RULES`: Custom JSON string pairs (default: `[]`), e.g. `[["Codex", "Antigravity"], ["My Client", "My Agent"]]`. Both strings must be nonempty. Names match literally, ignoring case; longer names take priority. Custom names override defaults and the last duplicate custom name wins. Replacement text is never scanned again
+
+OpenAI rewrites system/developer messages at every conversation position; Anthropic rewrites its top-level system field and instruction messages; Gemini rewrites text parts in systemInstruction/system_instruction. Code, filenames, dotfiles, paths, URLs, and MCP identifiers are protected. User/assistant/tool messages, tool definitions and arguments, images, and metadata retain their content. Each request is processed once; retries and anti-truncation continuations reuse the processed content.
+
+Legacy `SENSITIVE_WORDS_ENABLED` / `SENSITIVE_WORDS` environment variables and database keys remain supported. The old switch is inherited and comma/newline-separated keywords migrate to `[name, "Antigravity"]`. The first panel save persists new fields that are not locked by environment variables, with immediate hot updates. Priority: new environment variables → legacy environment variables → new database keys → legacy database keys → defaults. Explicit `false` and empty arrays take effect; invalid environment values log a warning and fall back to storage. Empty custom rules still use the built-in names when that switch is enabled.
 
 **Usage Log**
 - `USAGE_LOG_ENABLED`: Enable request logging (default: true). Records every API request (model, credential, token usage, latency, status) to the database. No automatic cleanup; use the panel to clear logs manually

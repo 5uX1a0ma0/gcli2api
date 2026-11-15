@@ -16,10 +16,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import (
-    apply_sensitive_word_filter,
     get_model_rewrite_filter,
     get_return_thoughts_to_frontend,
-    get_sensitive_word_filter,
     rewrite_model_name,
 )
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
@@ -669,64 +667,6 @@ def _apply_thinking(profile: ModelProfile, generation_config: Dict[str, Any], re
 
 # ==================== contents 处理 ====================
 
-async def _get_sensitive_word_patterns():
-    """读取生效的敏感词正则列表；未启用时返回 None（避免无谓的配置读取开销为 0 时的开销可忽略）"""
-    enabled, patterns = await get_sensitive_word_filter()
-    return patterns if enabled and patterns else None
-
-
-def _filter_text(text: str, patterns) -> str:
-    """对文本应用敏感词过滤（大小写不敏感，命中替换为空）"""
-    return apply_sensitive_word_filter(text, patterns)
-
-
-def _filter_contents_sensitive_words(contents: Any, patterns) -> Any:
-    """对 contents 内所有 text part 应用敏感词过滤（不修改入参）"""
-    if not isinstance(contents, list):
-        return contents
-
-    new_contents = []
-    for content in contents:
-        if not (isinstance(content, dict) and isinstance(content.get("parts"), list)):
-            new_contents.append(content)
-            continue
-
-        new_parts = []
-        for part in content["parts"]:
-            if (
-                isinstance(part, dict)
-                and isinstance(part.get("text"), str)
-                and part["text"]
-            ):
-                filtered = _filter_text(part["text"], patterns)
-                if filtered != part["text"]:
-                    part = {**part, "text": filtered}
-            new_parts.append(part)
-
-        new_contents.append({**content, "parts": new_parts})
-    return new_contents
-
-
-def _filter_system_instruction_sensitive_words(system_instruction: Any, patterns) -> Any:
-    """对 systemInstruction 的 text part 应用敏感词过滤（不修改入参）"""
-    if not (isinstance(system_instruction, dict) and isinstance(system_instruction.get("parts"), list)):
-        return system_instruction
-
-    new_parts = []
-    for part in system_instruction["parts"]:
-        if (
-            isinstance(part, dict)
-            and isinstance(part.get("text"), str)
-            and part["text"]
-        ):
-            filtered = _filter_text(part["text"], patterns)
-            if filtered != part["text"]:
-                part = {**part, "text": filtered}
-        new_parts.append(part)
-
-    return {**system_instruction, "parts": new_parts}
-
-
 def _clean_contents(contents: List[Any], model_name: str) -> List[Any]:
     """过滤空 part、规范 thoughtSignature、修正 text 字段类型、丢弃没有有效 part 的 content"""
     cleaned_contents = []
@@ -842,8 +782,7 @@ async def normalize_antigravity_request(
     规范化 Antigravity 请求
 
     处理逻辑:
-    0. 敏感词过滤（contents / systemInstruction，面板可配，热更新）
-    0.5 模型名复写（面板可配，热更新，支持正则与反向引用）
+    0. 模型名复写（面板可配，热更新，支持正则与反向引用）
     1. 按模型名取 profile (关键词匹配)
     2. 图片模型走独立路径
     3. 模型映射 + thinkingConfig (按 profile.thinking)
@@ -861,7 +800,7 @@ async def normalize_antigravity_request(
     generation_config = (result.get("generationConfig") or {}).copy()
     return_thoughts = await get_return_thoughts_to_frontend()
 
-    # ========== 0.5 模型名复写（面板可配，热更新） ==========
+    # ========== 0. 模型名复写（面板可配，热更新） ==========
     # 在抗截断前缀剥离之后、profile 解析之前应用：
     # 命中规则的模型名被替换为规则指定的模型名（支持正则与反向引用）
     rewrite_rules = await _get_model_rewrite_rules()
@@ -873,22 +812,6 @@ async def normalize_antigravity_request(
         model = rewritten
 
     profile = resolve_profile(model)
-
-    # ========== 0. 敏感词过滤 ==========
-    # 在所有内容处理之前应用：命中面板配置的敏感词（大小写不敏感）直接替换为空，
-    # 避免触发 Google API 端点的敏感词拦截
-    sensitive_patterns = await _get_sensitive_word_patterns()
-    if sensitive_patterns:
-        if isinstance(result.get("contents"), list):
-            result["contents"] = _filter_contents_sensitive_words(result["contents"], sensitive_patterns)
-        if result.get("systemInstruction") is not None:
-            result["systemInstruction"] = _filter_system_instruction_sensitive_words(
-                result.get("systemInstruction"), sensitive_patterns
-            )
-        if result.get("system_instruction") is not None:
-            result["system_instruction"] = _filter_system_instruction_sensitive_words(
-                result.get("system_instruction"), sensitive_patterns
-            )
 
     # 图片模型走独立的图片生成处理路径
     if profile.family == "image":

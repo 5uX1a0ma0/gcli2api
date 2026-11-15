@@ -21,6 +21,10 @@ const settings = {
   free_account_priority_enabled: true, credential_select_mode: "cache",
   auto_ban_error_codes: [403], retry_error_codes: [400, 403, 429, 500, 503],
   request_log_error_codes: [400], request_log_enabled: true,
+  prompt_rewrite_enabled: false, prompt_rewrite_use_default_keywords: true,
+  prompt_rewrite_rules: [["Legacy Client", "Antigravity"]],
+  sensitive_words_enabled: false, sensitive_words: ["Legacy Client"],
+  model_rewrite_enabled: true, model_rewrite_rules: [["^gpt-4$", "gemini-2.5-flash"]],
 };
 let envLocked = [], dedupScenario = "partial";
 const dedupRequests = [];
@@ -39,8 +43,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/config/get") return send({ config: settings, env_locked: envLocked });
     if (url.pathname === "/config/save") {
       let body = ""; for await (const chunk of req) body += chunk;
-      const config = JSON.parse(body).config; saves.push(config); Object.assign(settings, config);
-      return send({ message: "配置保存成功", saved_config: config });
+      const config = JSON.parse(body).config; saves.push(config);
+      const saved = Object.fromEntries(Object.entries(config).filter(([key]) => !envLocked.includes(key)));
+      Object.assign(settings, saved);
+      settings.sensitive_words_enabled = settings.prompt_rewrite_enabled;
+      settings.sensitive_words = settings.prompt_rewrite_rules.map(([name]) => name);
+      return send({ message: "配置保存成功", saved_config: saved });
     }
     if (url.pathname === "/creds/status") {
       summaries++;
@@ -161,13 +169,16 @@ try {
   const hasText = (text) => evaluate(`document.body?.innerText.includes(${JSON.stringify(text)}) ?? false`);
   const button = (text) => `[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(text)})`;
   const click = (text) => evaluate(`(()=>{const b=${button(text)};if(!b||b.disabled)throw Error('Unavailable button');b.click();})()`);
-  const listReady = () => waitFor(() => evaluate(`document.querySelectorAll('input[aria-label^=\"选择凭证 \" ]').length===${accounts.length}`), "credential list");
+  const listReady = () => waitFor(() => evaluate(`document.querySelectorAll('input[aria-label^=\"选择凭证 \" ]').length===${accounts.length}
+    && ${button("刷新状态")}?.disabled===false
+    && [...document.querySelectorAll('button[title="点击查看或刷新该凭证支持的模型列表"]')].every(b=>!b.disabled)`), "credential list ready for interaction");
   const select = async (count) => {
     await evaluate(`document.querySelectorAll('input[aria-label^="选择凭证 "]').forEach((i,index)=>{if(index<${count}&&!i.checked)i.click();})`);
     await waitFor(() => hasText(`已选 ${count} 项`), "selection");
   };
   const viewport = (width, height, mobile = false) => cdp("Emulation.setDeviceMetricsOverride", { width, height, mobile, deviceScaleFactor: 1 });
   const capture = async (name, full = false, target = "[role=progressbar]") => {
+    await evaluate("document.fonts.ready.then(() => true)");
     if (full) await evaluate("window.scrollTo(0,0)");
     else await evaluate(`document.querySelector(${JSON.stringify(target)})?.scrollIntoView({block:'center'})`);
     await delay(250);
@@ -196,7 +207,7 @@ try {
   await waitFor(() => hasText("刷新模型失败，请重试"), "model refresh failure");
   assert(await hasText("模型数：0")); await capture("desktop-models-error", false, "[role=dialog]");
   modelScenario = "success"; await click("刷新模型列表");
-  await waitFor(() => hasText("模型数：3"), "models refreshed");
+  await waitFor(async () => await hasText("模型数：3") && await hasText("claude-opus-5-5-high"), "models refreshed and visible");
   assert(await hasText("claude-opus-5-5-high")); assert.equal(accounts[0].paid, true);
   await capture("desktop-models-after", false, "[role=dialog]");
   await click("关闭"); await listReady();
@@ -317,6 +328,70 @@ try {
   envLocked = []; await click("刷新配置");
   await waitFor(() => evaluate("!!document.getElementById('retry_error_codes')"), "unlocked codes");
 
+  // Identity mappings reuse the editor, with literal names and their own validation.
+  await viewport(1440, 1000);
+  assert(await hasText("提示词身份改写")); assert(await hasText("旧词条已迁移"));
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_enabled').getAttribute('aria-checked')"), "false");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_use_default_keywords').getAttribute('aria-checked')"), "true");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-name').value"), "Legacy Client");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-name').placeholder"), "例如 Codex");
+  assert.equal(await evaluate("document.getElementById('model_rewrite_rules-0-name').placeholder"), "匹配正则，如 ^gpt-4$");
+  assert.equal(await evaluate("document.getElementById('prompt-rewrite-settings').textContent.includes('正则')"), false);
+  assert.equal(await evaluate("getComputedStyle(document.getElementById('prompt_rewrite_enabled-note')).color"), "rgb(156, 163, 175)");
+  await capture("desktop-prompt-before", false, "#prompt-rewrite-settings");
+  await evaluate("document.getElementById('prompt_rewrite_enabled').click()");
+  await waitFor(() => evaluate("document.getElementById('prompt_rewrite_enabled').getAttribute('aria-checked')==='true'"), "identity rewrite enabled");
+  await inputValue("prompt_rewrite_rules-0-name", " Codex ");
+  await inputValue("prompt_rewrite_rules-0-replacement", " ");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-replacement').getAttribute('aria-invalid')"), "true");
+  assert(await hasText("客户端名称和替换文本均不能为空"));
+  assert.equal(await evaluate(`${button("保存配置")}.disabled`), true);
+  const beforeInvalidRules = saves.length;
+  await capture("desktop-prompt-error", false, "#prompt-rewrite-settings");
+  assert.equal(saves.length, beforeInvalidRules);
+  await inputValue("prompt_rewrite_rules-0-replacement", " Bridge ");
+  const addPromptRule = async () => {
+    await evaluate("[...document.getElementById('prompt_rewrite_rules').querySelectorAll('button')].find(b=>b.textContent.trim()==='新增规则').click()");
+  };
+  await addPromptRule();
+  await waitFor(() => evaluate("!!document.getElementById('prompt_rewrite_rules-1-name')"), "second identity mapping");
+  assert.equal(await evaluate(`${button("保存配置")}.disabled`), true);
+  await inputValue("prompt_rewrite_rules-1-name", "cOdEx");
+  await inputValue("prompt_rewrite_rules-1-replacement", "Antigravity");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-1-name').getAttribute('aria-label')"), "客户端名称，第 2 条");
+  assert.equal(await evaluate(`${button("保存配置")}.disabled`), false);
+  await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "identity mappings saved");
+  assert.equal(saves.at(-1).prompt_rewrite_enabled, true);
+  assert.deepEqual(saves.at(-1).prompt_rewrite_rules, [["Codex", "Bridge"], ["cOdEx", "Antigravity"]]);
+  assert.equal(Object.hasOwn(saves.at(-1), "sensitive_words"), false);
+  assert.equal(Object.hasOwn(saves.at(-1), "sensitive_words_enabled"), false);
+  await click("关闭");
+  await waitFor(() => evaluate("document.getElementById('prompt_rewrite_rules-0-name')?.value==='Codex'"), "canonical saved identity rules");
+  assert.equal(await evaluate("(()=>{const r=document.getElementById('prompt_rewrite_rules-1-replacement').getBoundingClientRect();return r.top>=120&&r.bottom<=innerHeight})()"), true);
+  await capture("desktop-prompt-after", false, "#prompt-rewrite-settings");
+  await viewport(390, 844, true); await capture("mobile-prompt-rules", false, "#prompt-rewrite-settings");
+  assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"), true);
+  assert.equal(await evaluate("getComputedStyle(document.getElementById('prompt_rewrite_enabled').querySelector('span:last-child')).transitionProperty"), "none");
+  const removePromptRule = async () => evaluate("document.getElementById('prompt_rewrite_rules').querySelector('button[title=\"删除该规则\"]').click()");
+  await removePromptRule(); await removePromptRule();
+  await waitFor(() => hasText("暂无自定义规则；默认词表开启时仍会生效。"), "default keywords with empty custom rules");
+  assert.equal(await evaluate(`${button("保存配置")}.disabled`), false);
+  await evaluate("document.getElementById('prompt_rewrite_use_default_keywords').click()");
+  await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "empty identity policy saved");
+  assert.deepEqual(saves.at(-1).prompt_rewrite_rules, []);
+  assert.equal(saves.at(-1).prompt_rewrite_use_default_keywords, false);
+  await click("关闭");
+  await evaluate("document.getElementById('prompt_rewrite_use_default_keywords').click()");
+  await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "built-in identity keywords saved");
+  await click("关闭"); await capture("mobile-prompt-empty", false, "#prompt-rewrite-settings");
+  envLocked = ["prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords", "prompt_rewrite_rules", "sensitive_words_enabled", "sensitive_words"];
+  await click("刷新配置");
+  await waitFor(() => evaluate("document.getElementById('prompt-rewrite-settings')?.querySelectorAll('button').length===0"), "locked identity settings");
+  assert.equal(await evaluate("document.getElementById('prompt-rewrite-settings').textContent.split('该配置已被环境变量锁定').length-1"), 3);
+  await capture("mobile-prompt-locked", false, "#prompt-rewrite-settings");
+  envLocked = []; await click("刷新配置");
+  await waitFor(() => evaluate("!!document.getElementById('prompt_rewrite_enabled')"), "unlocked identity settings");
+
   // Scan selected records first; handle conflict, cancellation, errors and empty results.
   await viewport(1440, 1000); await click("凭证管理"); await listReady(); await select(3);
   await click("邮箱去重");
@@ -373,6 +448,8 @@ try {
     configSaves: saves.length, modelRefreshes: modelChecks.length, modelPeak, paidRefreshes: paidRefreshes.length, deduplicationRequests: dedupRequests.length, captures,
     states: ["model list", "model empty", "model failure", "model refresh", "model long names", "Paid refresh", "model batch stop", "model batch partial failure", "selected", "running", "partial failure", "stopped", "unmount", "saved setting", "keyboard", "mobile", "landscape", "reduced motion", "empty",
       "invalid code drafts", "normalized code save", "empty codes", "environment lock",
+      "identity migration", "identity mapping edit", "identity invalid replacement", "identity duplicate names",
+      "identity save", "identity saved scroll position", "identity empty rules", "identity defaults off", "identity defaults on", "identity environment lock",
       "selected deduplication", "changed selection", "all deduplication", "dedup preview", "conflict", "scan cancellation", "scan error", "no duplicates", "cleanup"] };
   await writeFile(path.join(output, "report.json"), JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2));
 } finally {

@@ -5,8 +5,9 @@ import Select from "../components/Select";
 import ErrorCodesField from "../components/ErrorCodesField";
 import api from "../api";
 import { parseErrorCodes } from "../utils/errorCodes.mjs";
+import { validatePromptRewriteRules } from "../utils/promptRewrite.mjs";
 
-// 多行文本（敏感词 / IP 白名单等，每行一条）：编辑期间保留原始文本（允许末尾空行与连续回车），
+// 多行文本（IP 白名单等，每行一条）：编辑期间保留原始文本（允许末尾空行与连续回车），
 // 仅在按键时把清洗后的数组回写配置（保证保存时取到最新值），失焦时再归一化显示。
 // 原实现在每次按键即时 split + 过滤空行，末尾按回车产生的新空行被立即移除，
 // 导致"最后一行按回车没反应"、无法换行新增词条。
@@ -138,10 +139,25 @@ const CONFIG_GROUPS = [
     ],
   },
   {
-    title: "敏感词过滤",
+    title: "提示词身份改写",
+    id: "prompt-rewrite-settings",
+    noteClassName: "text-gray-400",
     fields: [
-      { key: "sensitive_words_enabled", label: "启用敏感词过滤", type: "bool", note: "请求中命中敏感词的内容会被替换为空，避免触发 Google API 端点的敏感词拦截" },
-      { key: "sensitive_words", label: "敏感词列表", type: "textarea", showIf: (cfg) => !!cfg.sensitive_words_enabled, note: "每行一个词或短语，不区分大小写，支持中文。命中后整词替换为空。保存后立即生效（热更新）", placeholder: "例如：\nsensitive word\n敏感词\n另一个词" },
+      {
+        key: "prompt_rewrite_enabled", label: "启用提示词身份改写", type: "bool",
+        note: "仅改写系统 / 开发者指令中的客户端身份名称，默认替换为 Antigravity。代码、文件名、路径、URL 和 MCP 标识会保留。旧词条已迁移为名称映射，旧开关状态继续沿用。",
+      },
+      {
+        key: "prompt_rewrite_use_default_keywords", label: "使用内置默认词表", type: "bool",
+        note: "包含 Codex、Claude Code、Claude Agent SDK、Cursor 等客户端名称。自定义规则覆盖同名默认规则；空自定义列表仍可使用内置词表。",
+      },
+      {
+        key: "prompt_rewrite_rules", label: "自定义名称映射", type: "rules",
+        columnLabels: ["客户端名称", "替换文本"],
+        columnPlaceholders: ["例如 Codex", "例如 Antigravity"],
+        emptyHint: "暂无自定义规则；默认词表开启时仍会生效。",
+        note: "按名称字面量匹配，不区分大小写；较长名称优先，同名自定义规则以最后一条为准。名称与替换文本均不能为空，保存后立即生效。",
+      },
     ],
   },
   {
@@ -179,13 +195,17 @@ export default function Config() {
   const invalidCodeFields = ERROR_CODE_FIELDS.filter((field) =>
     !envLocked.includes(field.key) && !parseErrorCodes(config[field.key]).valid
   );
+  const promptRuleValidation = validatePromptRewriteRules(
+    config.prompt_rewrite_rules === undefined ? [] : config.prompt_rewrite_rules
+  );
+  const invalidPromptRules = !envLocked.includes("prompt_rewrite_rules") && !promptRuleValidation.valid;
 
   useEffect(() => {
     loadConfig();
   }, []);
 
   const loadConfig = async ({ silent = false } = {}) => {
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const res = await api.get("/config/get");
       setConfig(res.data.config || {});
@@ -194,7 +214,7 @@ export default function Config() {
     } catch (err) {
       setMessage({ type: "error", text: err.response?.data?.detail || "加载配置失败" });
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -203,7 +223,17 @@ export default function Config() {
       setMessage({ type: "error", text: `请修正无效的错误码：${invalidCodeFields.map((field) => field.label).join("、")}` });
       return;
     }
+    if (invalidPromptRules) {
+      setMessage({ type: "error", text: promptRuleValidation.error });
+      return;
+    }
     const payload = { ...config };
+    // 旧别名只供兼容读取，面板始终保存新字段。
+    delete payload.sensitive_words_enabled;
+    delete payload.sensitive_words;
+    if ("prompt_rewrite_rules" in payload && !envLocked.includes("prompt_rewrite_rules")) {
+      payload.prompt_rewrite_rules = promptRuleValidation.rules;
+    }
     for (const field of ERROR_CODE_FIELDS) {
       if (field.key in payload && !envLocked.includes(field.key)) {
         payload[field.key] = parseErrorCodes(payload[field.key]).codes;
@@ -213,7 +243,7 @@ export default function Config() {
     try {
       const res = await api.post("/config/save", { config: payload });
       setMessage({ type: "success", text: res.data.message || "配置保存成功" });
-      // 静默刷新配置（不清空刚显示的弹窗消息）
+      // 静默刷新保留表单与滚动位置，便于继续编辑刚保存的规则。
       await loadConfig({ silent: true });
     } catch (err) {
       setMessage({ type: "error", text: err.response?.data?.detail || "保存配置失败" });
@@ -275,6 +305,7 @@ export default function Config() {
       return (
         <label className="flex items-center gap-3 cursor-pointer select-none">
           <button
+            id={field.key}
             type="button"
             role="switch"
             aria-label={field.label}
@@ -330,6 +361,9 @@ export default function Config() {
     }
 
     if (field.type === "rules") {
+      const columnLabels = field.columnLabels || ["匹配正则", "替换模型名"];
+      const columnPlaceholders = field.columnPlaceholders || ["匹配正则，如 ^gpt-4$", "替换模型名，如 gemini-2.5-pro"];
+      const validation = field.key === "prompt_rewrite_rules" ? promptRuleValidation : null;
       const rules = Array.isArray(value)
         ? value.map((r) => (Array.isArray(r) ? [String(r[0] ?? ""), String(r[1] ?? "")] : ["", ""]))
         : [];
@@ -345,37 +379,64 @@ export default function Config() {
         setField(field.key, [...rules, ["", ""]]);
       };
       return (
-        <div className="space-y-2">
+        <div id={field.key} role="group" aria-label={field.label} className="space-y-2">
           {rules.length === 0 && (
-            <div className="text-xs text-gray-500 bg-dark-800/60 border border-dark-700 rounded-lg px-3 py-2">
-              暂无规则，点击下方按钮新增
+            <div className={`text-xs ${field.key === "prompt_rewrite_rules" ? "text-gray-400" : "text-gray-500"} bg-dark-800/60 border border-dark-700 rounded-lg px-3 py-2`}>
+              {field.emptyHint || "暂无规则，点击下方按钮新增"}
+            </div>
+          )}
+          {rules.length > 0 && (
+            <div className="flex items-center gap-2 pr-10 text-xs text-gray-400">
+              <span className="flex-1 min-w-0">{columnLabels[0]}</span>
+              <span aria-hidden="true" className="shrink-0">→</span>
+              <span className="flex-1 min-w-0">{columnLabels[1]}</span>
             </div>
           )}
           {rules.map((rule, idx) => (
-            <div key={idx} className="flex items-center gap-2">
+            <div key={idx} className="space-y-1.5">
+            <div className="flex items-center gap-2">
               <input
+                id={`${field.key}-${idx}-name`}
                 type="text"
                 value={rule[0]}
                 onChange={(e) => updateRule(idx, 0, e.target.value)}
-                placeholder="匹配正则，如 ^gpt-4$"
-                className="flex-1 min-w-0 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+                placeholder={columnPlaceholders[0]}
+                aria-label={`${columnLabels[0]}，第 ${idx + 1} 条`}
+                aria-invalid={!!validation?.rowErrors[idx]}
+                aria-describedby={`${validation?.rowErrors[idx] ? `${field.key}-${idx}-error ` : ""}${field.key}-note`}
+                autoComplete="off"
+                spellCheck={false}
+                className={`flex-1 min-w-0 px-3 py-2 bg-dark-800 border ${validation?.rowErrors[idx] ? "border-red-500" : "border-dark-600"} rounded-lg text-sm text-white placeholder-gray-500 font-mono`}
               />
-              <span className="text-gray-500 text-sm shrink-0">→</span>
+              <span aria-hidden="true" className="text-gray-500 text-sm shrink-0">→</span>
               <input
+                id={`${field.key}-${idx}-replacement`}
                 type="text"
                 value={rule[1]}
                 onChange={(e) => updateRule(idx, 1, e.target.value)}
-                placeholder="替换模型名，如 gemini-2.5-pro"
-                className="flex-1 min-w-0 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+                placeholder={columnPlaceholders[1]}
+                aria-label={`${columnLabels[1]}，第 ${idx + 1} 条`}
+                aria-invalid={!!validation?.rowErrors[idx]}
+                aria-describedby={`${validation?.rowErrors[idx] ? `${field.key}-${idx}-error ` : ""}${field.key}-note`}
+                autoComplete="off"
+                spellCheck={false}
+                className={`flex-1 min-w-0 px-3 py-2 bg-dark-800 border ${validation?.rowErrors[idx] ? "border-red-500" : "border-dark-600"} rounded-lg text-sm text-white placeholder-gray-500 font-mono`}
               />
               <button
                 type="button"
                 onClick={() => removeRule(idx)}
                 className="shrink-0 p-2 text-gray-500 hover:text-red-400 transition-colors"
                 title="删除该规则"
+                aria-label={`删除${field.label}第 ${idx + 1} 条`}
               >
                 <Trash2 size={16} />
               </button>
+            </div>
+            {validation?.rowErrors[idx] && (
+              <p id={`${field.key}-${idx}-error`} className="text-xs text-red-300" aria-live="polite">
+                {validation.rowErrors[idx]}
+              </p>
+            )}
             </div>
           ))}
           <button
@@ -431,7 +492,7 @@ export default function Config() {
         </button>
         <button
           onClick={saveConfig}
-          disabled={saving || loading || invalidCodeFields.length > 0}
+          disabled={saving || loading || invalidCodeFields.length > 0 || invalidPromptRules}
           className="btn btn-primary text-sm flex items-center gap-1.5 disabled:opacity-50"
         >
           {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
@@ -441,6 +502,11 @@ export default function Config() {
         {!loading && invalidCodeFields.length > 0 && (
           <p className="mt-2 text-xs text-red-300" role="status">
             {invalidCodeFields.map((field) => field.label).join("、")}格式无效，修正后才能保存。
+          </p>
+        )}
+        {!loading && invalidPromptRules && (
+          <p className="mt-2 text-xs text-red-300" role="status">
+            自定义名称映射格式无效，修正后才能保存。
           </p>
         )}
       </div>
@@ -459,7 +525,7 @@ export default function Config() {
       ) : (
         <div className="space-y-6">
           {CONFIG_GROUPS.map((group) => (
-            <div key={group.title} className="card">
+            <div key={group.title} id={group.id} className="card">
               <h3 className="text-base font-semibold text-purple-400 mb-4 border-b border-dark-700 pb-3">
                 {group.title}
               </h3>
@@ -493,7 +559,7 @@ export default function Config() {
                       </label>
                       {renderField(field)}
                       {field.note && (
-                        <p id={`${field.key}-note`} className="text-xs text-gray-500 mt-1.5">{field.note}</p>
+                        <p id={`${field.key}-note`} className={`text-xs ${group.noteClassName || "text-gray-500"} mt-1.5`}>{field.note}</p>
                       )}
                     </div>
                   ))}

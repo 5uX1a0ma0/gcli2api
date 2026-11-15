@@ -280,9 +280,15 @@ docker compose -f docker-compose.yml up -d --no-deps --pull never agy2api
 **响应行为配置**
 - `RETURN_THOUGHTS_TO_FRONTEND`: 返回思维链到前端（默认：true）
 
-**敏感词过滤配置**
-- `SENSITIVE_WORDS_ENABLED`: 启用敏感词过滤（默认：false）
-- `SENSITIVE_WORDS`: 敏感词列表，逗号或换行分隔（默认：空）。命中后整词替换为空，不区分大小写，支持中文，面板保存后立即生效
+**提示词身份改写配置**
+
+- `PROMPT_REWRITE_ENABLED`: 启用身份名称改写（新实例默认：false）
+- `PROMPT_REWRITE_USE_DEFAULT_KEYWORDS`: 使用内置客户端词表（默认：true），名称统一替换为 `Antigravity`，包含 Codex、Claude Code、Claude Agent SDK、Cursor 等
+- `PROMPT_REWRITE_RULES`: 自定义 JSON 二元组数组（默认：`[]`），例如 `[["Codex", "Antigravity"], ["My Client", "My Agent"]]`。名称和替换文本均须为非空字符串；名称按字面量匹配，不区分大小写，较长名称优先。自定义覆盖同名默认规则，同名自定义规则以最后一条为准，替换结果不再次参与匹配
+
+OpenAI 改写所有位置的 system/developer 消息；Anthropic 改写顶层 system 和指令消息；Gemini 改写 systemInstruction/system_instruction 的文本部件。代码、文件名、点文件、路径、URL 和 MCP 标识受保护，普通用户/助手/工具消息、工具定义与参数、图片和 metadata 保留。每次请求只处理一次，重试与抗截断续传复用处理后的内容。
+
+旧 `SENSITIVE_WORDS_ENABLED` / `SENSITIVE_WORDS` 环境变量和数据库字段仍可使用：旧开关状态继续沿用，旧词表（逗号或换行分隔）迁移为 `[名称, "Antigravity"]`。首次保存配置时写入未被环境变量锁定的新字段，保存后立即生效。优先级为新环境变量 → 旧环境变量 → 新数据库字段 → 旧数据库字段 → 默认值；显式 `false` 和空数组生效，无效环境变量告警并回退数据库。默认词表开启时，空自定义列表仍会改写。
 
 **请求日志配置**
 - `USAGE_LOG_ENABLED`: 启用请求日志（默认：true）。记录每次 API 请求（模型、凭证、token 用量、耗时、状态）到数据库，不自动清理，可在面板手动清理或清空

@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # 本地模块 - 配置和日志
-from config import get_anti_truncation_max_attempts, get_api_password
+from config import get_anti_truncation_max_attempts, get_api_password, get_prompt_rewrite_config
 from log import log
 
 # 本地模块 - 工具和认证
@@ -52,6 +52,7 @@ from src.converter.anthropic2gemini import (
     gemini_stream_to_anthropic_stream,
 )
 from src.converter.antigravity_fix import normalize_antigravity_request
+from src.converter.prompt_rewrite import rewrite_request
 from src.converter.anti_truncation import (
     AntiTruncationStreamProcessor,
     apply_anti_truncation,
@@ -87,6 +88,12 @@ async def messages(
     if is_health_check_request(normalized_dict, format="anthropic"):
         response = create_health_check_response(format="anthropic")
         return JSONResponse(content=response)
+
+    normalized_dict, rewrite_count = rewrite_request(
+        normalized_dict, "anthropic", await get_prompt_rewrite_config(),
+    )
+    if rewrite_count:
+        log.info(f"[PROMPT-REWRITE] format=anthropic replacements={rewrite_count}")
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(claude_request.model)

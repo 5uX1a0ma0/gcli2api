@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 # 本地模块 - 配置和日志
-from config import get_anti_truncation_max_attempts
+from config import get_anti_truncation_max_attempts, get_prompt_rewrite_config
 from log import log
 
 # 本地模块 - 工具和认证
@@ -46,6 +46,7 @@ from src.api.antigravity import non_stream_request, stream_request
 
 # 本地模块 - 转换器
 from src.converter.antigravity_fix import normalize_antigravity_request
+from src.converter.prompt_rewrite import rewrite_request
 from src.converter.anti_truncation import (
     AntiTruncationStreamProcessor,
     apply_anti_truncation,
@@ -84,6 +85,12 @@ async def generate_content(
     if is_health_check_request(normalized_dict, format="gemini"):
         response = create_health_check_response(format="gemini")
         return JSONResponse(content=response)
+
+    normalized_dict, rewrite_count = rewrite_request(
+        normalized_dict, "gemini", await get_prompt_rewrite_config(),
+    )
+    if rewrite_count:
+        log.info(f"[PROMPT-REWRITE] format=gemini replacements={rewrite_count}")
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(model)
@@ -151,6 +158,17 @@ async def stream_generate_content(
 
     # 转换为字典
     normalized_dict = model_to_dict(gemini_request)
+
+    # 健康检查与非流式入口保持一致，身份改写只在生成请求中执行一次。
+    if is_health_check_request(normalized_dict, format="gemini"):
+        response = create_health_check_response(format="gemini")
+        return JSONResponse(content=response)
+
+    normalized_dict, rewrite_count = rewrite_request(
+        normalized_dict, "gemini", await get_prompt_rewrite_config(),
+    )
+    if rewrite_count:
+        log.info(f"[PROMPT-REWRITE] format=gemini replacements={rewrite_count}")
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(model)

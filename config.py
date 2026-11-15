@@ -13,6 +13,11 @@ import re
 from typing import Any, Optional
 
 from log import log
+from src.converter.prompt_rewrite import (
+    DEFAULT_REPLACEMENT,
+    PromptRewriteConfig,
+    validate_prompt_rewrite_rules,
+)
 from src.error_codes import parse_error_codes
 from src.storage.database import get_database
 
@@ -45,6 +50,9 @@ ENV_MAPPINGS = {
     "RETURN_THOUGHTS_TO_FRONTEND": "return_thoughts_to_frontend",
     "SENSITIVE_WORDS": "sensitive_words",
     "SENSITIVE_WORDS_ENABLED": "sensitive_words_enabled",
+    "PROMPT_REWRITE_ENABLED": "prompt_rewrite_enabled",
+    "PROMPT_REWRITE_USE_DEFAULT_KEYWORDS": "prompt_rewrite_use_default_keywords",
+    "PROMPT_REWRITE_RULES": "prompt_rewrite_rules",
     "IP_WHITELIST": "ip_whitelist",
     "IP_WHITELIST_ENABLED": "ip_whitelist_enabled",
     "MODEL_REWRITE_ENABLED": "model_rewrite_enabled",
@@ -308,99 +316,143 @@ async def get_return_thoughts_to_frontend() -> bool:
     return bool(await get_config_value("return_thoughts_to_frontend", True))
 
 
-# ====================== 敏感词过滤 ======================
+# ====================== 提示词身份改写 ======================
 
-# 敏感词正则编译缓存: (原始词表指纹, 编译后的 pattern 列表)
-_sensitive_words_cache: dict = {"fingerprint": None, "patterns": []}
+PROMPT_REWRITE_KEYS = frozenset({
+    "prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords", "prompt_rewrite_rules",
+})
+LEGACY_PROMPT_REWRITE_KEYS = frozenset({"sensitive_words_enabled", "sensitive_words"})
+
+
+def _parse_prompt_rewrite_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off"):
+            return False
+    raise ValueError("必须是布尔值（true/false、1/0、yes/no 或 on/off）")
+
+
+def migrate_sensitive_words(value: Any) -> list[list[str]]:
+    """旧词表按字面量迁移；保留逗号/换行分隔的旧环境变量格式。"""
+    if isinstance(value, str):
+        value = re.split(r"[,\n]", value)
+    if not isinstance(value, list) or not all(isinstance(word, str) for word in value):
+        raise ValueError("旧词表必须是字符串数组或逗号/换行分隔的文本")
+    return [[word.strip(), DEFAULT_REPLACEMENT] for word in value if word.strip()]
+
+
+def _parse_prompt_rewrite_rules_env(value: str) -> list[list[str]]:
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("规则必须是 JSON 字符串二元组数组") from exc
+    return validate_prompt_rewrite_rules(parsed)
+
+
+def _prompt_rewrite_env_values(*, warn: bool = True) -> dict[str, Any]:
+    candidates = (
+        ("prompt_rewrite_enabled", (
+            ("PROMPT_REWRITE_ENABLED", _parse_prompt_rewrite_bool),
+            ("SENSITIVE_WORDS_ENABLED", _parse_prompt_rewrite_bool),
+        )),
+        ("prompt_rewrite_use_default_keywords", (
+            ("PROMPT_REWRITE_USE_DEFAULT_KEYWORDS", _parse_prompt_rewrite_bool),
+        )),
+        ("prompt_rewrite_rules", (
+            ("PROMPT_REWRITE_RULES", _parse_prompt_rewrite_rules_env),
+            ("SENSITIVE_WORDS", migrate_sensitive_words),
+        )),
+    )
+    # No awaits after capturing environment and database values: each request gets
+    # one immutable configuration, even if a save reloads the cache during retries.
+    environment = {name: os.getenv(name) for _, sources in candidates for name, _ in sources}
+    overrides = {}
+    for key, sources in candidates:
+        for name, parser in sources:
+            raw = environment[name]
+            if raw is None:
+                continue
+            try:
+                overrides[key] = parser(raw)
+            except ValueError as exc:
+                if warn:
+                    log.warning(f"{name} 配置无效，使用数据库配置或默认值: {exc}")
+                # An invalid environment value falls back to storage, and does
+                # not lock the field or promote a lower-priority legacy variable.
+            break
+    return overrides
+
+
+def get_prompt_rewrite_env_locked_keys() -> set[str]:
+    locked = set(_prompt_rewrite_env_values(warn=False))
+    if "prompt_rewrite_enabled" in locked:
+        locked.add("sensitive_words_enabled")
+    if "prompt_rewrite_rules" in locked:
+        locked.add("sensitive_words")
+    return locked
+
+
+def _prompt_rewrite_storage_value(storage, key, parser, default, legacy_key=None, legacy_parser=None):
+    for name, parse in ((key, parser), (legacy_key, legacy_parser)):
+        if name is None or name not in storage:
+            continue
+        try:
+            return parse(storage[name])
+        except ValueError as exc:
+            log.warning(f"{name} 配置无效，使用兼容配置或默认值: {exc}")
+    return default
+
+
+async def get_prompt_rewrite_config() -> PromptRewriteConfig:
+    """新 ENV → 旧 ENV → 新数据库字段 → 旧数据库字段 → 默认值。"""
+    if not _config_initialized:
+        await init_config()
+    storage = _config_cache
+    overrides = _prompt_rewrite_env_values()
+    enabled = overrides.get("prompt_rewrite_enabled")
+    if enabled is None:
+        enabled = _prompt_rewrite_storage_value(
+            storage, "prompt_rewrite_enabled", _parse_prompt_rewrite_bool, False,
+            "sensitive_words_enabled", _parse_prompt_rewrite_bool,
+        )
+    use_defaults = overrides.get("prompt_rewrite_use_default_keywords")
+    if use_defaults is None:
+        use_defaults = _prompt_rewrite_storage_value(
+            storage, "prompt_rewrite_use_default_keywords", _parse_prompt_rewrite_bool, True,
+        )
+    rules = overrides.get("prompt_rewrite_rules")
+    if rules is None:
+        rules = _prompt_rewrite_storage_value(
+            storage, "prompt_rewrite_rules", validate_prompt_rewrite_rules, [],
+            "sensitive_words", migrate_sensitive_words,
+        )
+    return PromptRewriteConfig(enabled, use_defaults, tuple(tuple(rule) for rule in rules))
+
+
+async def get_prompt_rewrite_enabled() -> bool:
+    return (await get_prompt_rewrite_config()).enabled
+
+
+async def get_prompt_rewrite_use_default_keywords() -> bool:
+    return (await get_prompt_rewrite_config()).use_default_keywords
+
+
+async def get_prompt_rewrite_rules() -> list[list[str]]:
+    return [list(rule) for rule in (await get_prompt_rewrite_config()).rules]
 
 
 async def get_sensitive_words_enabled() -> bool:
-    """
-    敏感词过滤开关。
-
-    Environment variable: SENSITIVE_WORDS_ENABLED
-    Database config key: sensitive_words_enabled
-    Default: False
-    """
-    env_value = os.getenv("SENSITIVE_WORDS_ENABLED")
-    if env_value:
-        return env_value.lower() in ("true", "1", "yes", "on")
-
-    return bool(await get_config_value("sensitive_words_enabled", False))
+    """兼容旧配置读取入口，返回当前身份改写开关。"""
+    return await get_prompt_rewrite_enabled()
 
 
-async def get_sensitive_words() -> list:
-    """
-    敏感词列表（支持正则），每行一个；空列表表示不过滤。
-
-    Environment variable: SENSITIVE_WORDS (逗号或换行分隔)
-    Database config key: sensitive_words
-    Default: []
-    """
-    env_value = os.getenv("SENSITIVE_WORDS")
-    if env_value:
-        words = [w.strip() for w in re.split(r"[,\n]", env_value) if w.strip()]
-        return words
-
-    value = await get_config_value("sensitive_words")
-    if isinstance(value, list):
-        return [str(w) for w in value if str(w).strip()]
-    if isinstance(value, str) and value.strip():
-        return [w.strip() for w in re.split(r"[,\n]", value) if w.strip()]
-    return []
-
-
-def compile_sensitive_words(words: list):
-    """
-    编译敏感词为大小写不敏感的正则列表（带缓存）。
-
-    每个词按字面量转义后编译（用户输入的是词/短语而非正则语法），
-    触发后整词替换为空。支持中文（re.UNICODE 默认开启）。
-
-    Returns:
-        编译后的 Pattern 列表；无效条目跳过并告警。
-    """
-    fingerprint = tuple(words)
-    if _sensitive_words_cache["fingerprint"] == fingerprint:
-        return _sensitive_words_cache["patterns"]
-
-    patterns = []
-    for word in words:
-        word = str(word).strip()
-        if not word:
-            continue
-        try:
-            patterns.append(re.compile(re.escape(word), re.IGNORECASE | re.UNICODE))
-        except re.error as e:
-            log.warning(f"敏感词编译失败，已跳过: {word!r} ({e})")
-
-    _sensitive_words_cache["fingerprint"] = fingerprint
-    _sensitive_words_cache["patterns"] = patterns
-    return patterns
-
-
-def apply_sensitive_word_filter(text: str, patterns) -> str:
-    """将文本中命中的敏感词（大小写不敏感）替换为空"""
-    if not text or not patterns:
-        return text
-    for pattern in patterns:
-        text = pattern.sub("", text)
-    return text
-
-
-async def get_sensitive_word_filter():
-    """
-    获取生效的敏感词过滤条件（供请求处理管道调用）。
-
-    Returns:
-        (enabled, patterns)；未启用时 patterns 为空列表。
-    """
-    if not await get_sensitive_words_enabled():
-        return False, []
-    words = await get_sensitive_words()
-    if not words:
-        return False, []
-    return True, compile_sensitive_words(words)
+async def get_sensitive_words() -> list[str]:
+    """兼容旧词表读取入口，返回生效的自定义规则名称。"""
+    return [name for name, _ in (await get_prompt_rewrite_config()).rules]
 
 
 # ====================== IP 白名单 ======================

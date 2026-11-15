@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 import config
 from log import log
+from src.converter.prompt_rewrite import validate_prompt_rewrite_rules
 from src.models import ConfigSaveRequest
 from src.storage.database import get_database
 from src.utils import verify_panel_token
@@ -54,10 +55,6 @@ async def get_config(token: str = Depends(verify_panel_token)):
         # 思维链返回配置
         current_config["return_thoughts_to_frontend"] = await config.get_return_thoughts_to_frontend()
 
-        # 敏感词过滤配置
-        current_config["sensitive_words_enabled"] = await config.get_sensitive_words_enabled()
-        current_config["sensitive_words"] = await config.get_sensitive_words()
-
         # IP 白名单配置
         current_config["ip_whitelist_enabled"] = await config.get_ip_whitelist_enabled()
         current_config["ip_whitelist"] = await config.get_ip_whitelist()
@@ -92,8 +89,20 @@ async def get_config(token: str = Depends(verify_panel_token)):
 
         # 合并存储系统配置（不覆盖环境变量）
         for key, value in storage_config.items():
-            if key not in env_locked_keys:
+            if key not in env_locked_keys and key not in (
+                config.PROMPT_REWRITE_KEYS | config.LEGACY_PROMPT_REWRITE_KEYS
+            ):
                 current_config[key] = value
+
+        # 返回同一份有效配置及旧别名，避免旧数据库字段覆盖迁移/环境变量结果。
+        rewrite = await config.get_prompt_rewrite_config()
+        current_config.update({
+            "prompt_rewrite_enabled": rewrite.enabled,
+            "prompt_rewrite_use_default_keywords": rewrite.use_default_keywords,
+            "prompt_rewrite_rules": [list(rule) for rule in rewrite.rules],
+            "sensitive_words_enabled": rewrite.enabled,
+            "sensitive_words": [name for name, _ in rewrite.rules],
+        })
 
         return JSONResponse(content={"config": current_config, "env_locked": list(env_locked_keys)})
 
@@ -107,7 +116,20 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
     """保存配置"""
     try:
 
-        new_config = request.config
+        new_config = dict(request.config)
+
+        # 新字段在同一请求中优先；旧入口仍可保存，但只写入新字段。
+        if "prompt_rewrite_enabled" not in new_config and "sensitive_words_enabled" in new_config:
+            new_config["prompt_rewrite_enabled"] = new_config["sensitive_words_enabled"]
+        if "prompt_rewrite_rules" not in new_config and "sensitive_words" in new_config:
+            if not isinstance(new_config["sensitive_words"], list):
+                raise HTTPException(status_code=400, detail="旧词表必须是字符串数组")
+            try:
+                new_config["prompt_rewrite_rules"] = config.migrate_sensitive_words(new_config["sensitive_words"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        for key in config.LEGACY_PROMPT_REWRITE_KEYS:
+            new_config.pop(key, None)
 
         log.debug(f"收到的配置数据: {list(new_config.keys())}")
 
@@ -157,29 +179,15 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if not isinstance(new_config["return_thoughts_to_frontend"], bool):
                 raise HTTPException(status_code=400, detail="思维链返回开关必须是布尔值")
 
-        # 验证敏感词过滤配置
-        if "sensitive_words_enabled" in new_config:
-            if not isinstance(new_config["sensitive_words_enabled"], bool):
-                raise HTTPException(status_code=400, detail="敏感词过滤开关必须是布尔值")
-
-        if "sensitive_words" in new_config:
-            words = new_config["sensitive_words"]
-            if not isinstance(words, list):
-                raise HTTPException(status_code=400, detail="敏感词列表必须是数组（每行一个词）")
-
-            cleaned_words = []
-            for word in words:
-                if not isinstance(word, str):
-                    raise HTTPException(status_code=400, detail=f"敏感词必须是字符串: {word!r}")
-                word = word.strip()
-                if not word:
-                    continue
-                try:
-                    re.compile(re.escape(word), re.IGNORECASE | re.UNICODE)
-                except re.error:
-                    raise HTTPException(status_code=400, detail=f"无效的敏感词: {word!r}")
-                cleaned_words.append(word)
-            new_config["sensitive_words"] = cleaned_words
+        # 验证整份身份改写配置；禁止空名称、空替换文本和部分接受规则。
+        for key in ("prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords"):
+            if key in new_config and not isinstance(new_config[key], bool):
+                raise HTTPException(status_code=400, detail="身份改写开关必须是布尔值")
+        if "prompt_rewrite_rules" in new_config:
+            try:
+                new_config["prompt_rewrite_rules"] = validate_prompt_rewrite_rules(new_config["prompt_rewrite_rules"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # 验证 IP 白名单配置（每行一条，支持单 IP / CIDR / 起止范围，IPv4 / IPv6）
         if "ip_whitelist_enabled" in new_config:
@@ -274,8 +282,19 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         # 获取环境变量锁定的配置键
         env_locked_keys = get_env_locked_keys()
 
-        # 直接写入数据库
         database = await get_database()
+        storage_config = await database.get_all_config()
+        # 惰性迁移：首次保存其他配置时也写入未被环境变量锁定的新字段。
+        rewrite = await config.get_prompt_rewrite_config()
+        for key, value in (
+            ("prompt_rewrite_enabled", rewrite.enabled),
+            ("prompt_rewrite_use_default_keywords", rewrite.use_default_keywords),
+            ("prompt_rewrite_rules", [list(rule) for rule in rewrite.rules]),
+        ):
+            if key not in storage_config and key not in env_locked_keys:
+                new_config.setdefault(key, value)
+
+        # 直接写入数据库
         for key, value in new_config.items():
             if key not in env_locked_keys:
                 await database.set_config(key, value)

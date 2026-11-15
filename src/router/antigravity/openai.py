@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # 本地模块 - 配置和日志
-from config import get_anti_truncation_max_attempts
+from config import get_anti_truncation_max_attempts, get_prompt_rewrite_config
 from log import log
 
 # 本地模块 - 工具和认证
@@ -50,6 +50,7 @@ from src.converter.openai2gemini import (
     convert_gemini_to_openai_stream,
 )
 from src.converter.antigravity_fix import normalize_antigravity_request
+from src.converter.prompt_rewrite import rewrite_request
 from src.converter.anti_truncation import (
     AntiTruncationStreamProcessor,
     apply_anti_truncation,
@@ -85,6 +86,12 @@ async def chat_completions(
     if is_health_check_request(normalized_dict, format="openai"):
         response = create_health_check_response(format="openai")
         return JSONResponse(content=response)
+
+    normalized_dict, rewrite_count = rewrite_request(
+        normalized_dict, "openai", await get_prompt_rewrite_config(),
+    )
+    if rewrite_count:
+        log.info(f"[PROMPT-REWRITE] format=openai replacements={rewrite_count}")
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(openai_request.model)
