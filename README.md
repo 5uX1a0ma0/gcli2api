@@ -284,9 +284,12 @@ docker compose -f docker-compose.yml up -d --no-deps --pull never agy2api
 
 - `PROMPT_REWRITE_ENABLED`: 启用身份名称改写（新实例默认：false）
 - `PROMPT_REWRITE_USE_DEFAULT_KEYWORDS`: 使用内置客户端词表（默认：true），名称统一替换为 `Antigravity`，包含 Codex、Claude Code、Claude Agent SDK、Cursor 等
-- `PROMPT_REWRITE_RULES`: 自定义 JSON 二元组数组（默认：`[]`），例如 `[["Codex", "Antigravity"], ["My Client", "My Agent"]]`。名称和替换文本均须为非空字符串；名称按字面量匹配，不区分大小写，较长名称优先。自定义覆盖同名默认规则，同名自定义规则以最后一条为准，替换结果不再次参与匹配
+- `PROMPT_REWRITE_RULES`: 自定义 JSON 二元组数组（默认：`[]`），例如 `[["Codex", ""], ["My Client", "My Agent"]]`。名称不能为空，替换文本留空表示删除命中内容；两列首尾空白会去除。自定义按字面量查找全部消息正文，包括代码、路径和名称子串，不区分大小写；较长自定义名称优先，同名规则以最后一条为准。自定义优先于内置词表和身份归一化，替换结果不再次参与匹配
+- `PROMPT_REWRITE_CLOAK_ENABLED`: 暴力零宽打散（默认：false），独立于关键词改写开关和词表生效。只对系统 / 开发者指令及工具描述（含参数描述）中的英文词打散：至少 5 个字母时，在第 3 个字母后插入真实的零宽空格 `U+200B`，例如 `Codex → Cod\u200Bex`。已含零宽空格的词不会再次打散；此模式同样会处理这些文本里的代码、路径和 URL
 
-OpenAI 改写所有位置的 system/developer 消息；Anthropic 改写顶层 system 和指令消息；Gemini 改写 systemInstruction/system_instruction 的文本部件。代码、文件名、点文件、路径、URL 和 MCP 标识受保护，普通用户/助手/工具消息、工具定义与参数、图片和 metadata 保留。每次请求只处理一次，重试与抗截断续传复用处理后的内容。
+关键词替换覆盖 OpenAI / Anthropic 的所有角色消息正文、Anthropic 嵌套 tool_result 正文、Gemini contents 文本和 functionResponse 中的字符串值，以及工具描述。内置词表继续保护代码、文件名、点文件、路径、URL 和 MCP 标识；自定义规则用于完整的字面量查找替换。工具名称、调用 ID、参数值、图片数据、已签名的思考块及 metadata 保留。
+
+开启关键词改写和内置词表时，系统 / 开发者指令另外参考 [MatrixC7/magpie-middleware-antigravity-identity](https://github.com/MatrixC7/magpie-middleware-antigravity-identity) 清理独立的 `x-anthropic-billing-header` 行，把明确的客户端身份声明归一化为官方 Antigravity 身份，并折叠文首连续的顶层纯身份段落。身份句后的业务约束、工具规则和代码示例保留；自定义映射优先。每次请求只处理一次，重试与抗截断续传复用处理后的内容；保存配置后立即生效。参考实现的 MIT 声明见 [许可证](docs/licenses/magpie-antigravity-identity-MIT.txt)。
 
 旧 `SENSITIVE_WORDS_ENABLED` / `SENSITIVE_WORDS` 环境变量和数据库字段仍可使用：旧开关状态继续沿用，旧词表（逗号或换行分隔）迁移为 `[名称, "Antigravity"]`。首次保存配置时写入未被环境变量锁定的新字段，保存后立即生效。优先级为新环境变量 → 旧环境变量 → 新数据库字段 → 旧数据库字段 → 默认值；显式 `false` 和空数组生效，无效环境变量告警并回退数据库。默认词表开启时，空自定义列表仍会改写。
 

@@ -1,4 +1,4 @@
-"""Instruction rewriting must preserve technical references and unrelated objects."""
+"""All message text is rewritten without mutating protocol data or source objects."""
 
 import copy
 
@@ -7,12 +7,14 @@ import pytest
 from src.converter.prompt_rewrite import (
     DEFAULT_KEYWORDS,
     PromptRewriteConfig,
+    cloak_text,
     compile_prompt_rewrite_rules,
     protected_intervals,
     rewrite_prompt_text,
     rewrite_request,
     validate_prompt_rewrite_rules,
 )
+from src.converter.prompt_identity import OFFICIAL_ANTIGRAVITY_IDENTITY
 
 
 ENABLED = PromptRewriteConfig(enabled=True)
@@ -123,7 +125,7 @@ def test_long_unbroken_identifiers_do_not_change_and_do_not_hide_following_names
 @pytest.mark.parametrize("rules", [
     None, {}, "[]", True, ["Codex"], [["Codex"]], [["Codex", "Agent", "extra"]],
     [[1, "Agent"]], [["Codex", None]], [["", "Agent"]], [["  ", "Agent"]],
-    [["Codex", ""]], [["Codex", " \n"]], [["Codex", "Agent"], ["", "invalid"]],
+    [["Codex", "Agent"], ["", "invalid"]],
 ])
 def test_rule_validation_rejects_the_entire_invalid_list(rules):
     with pytest.raises(ValueError):
@@ -137,10 +139,11 @@ def test_rule_validation_trims_strings_without_changing_the_input():
     assert validate_prompt_rewrite_rules([]) == []
     assert validate_prompt_rewrite_rules([["\u0085Codex\u001c", "\u3000Agent\u00a0"]]) == [["Codex", "Agent"]]
     assert validate_prompt_rewrite_rules([["\ufeff", "\ufeff"]]) == [["\ufeff", "\ufeff"]]
+    assert validate_prompt_rewrite_rules([[" Codex ", ""], ["Cursor", " \n"]]) == [["Codex", ""], ["Cursor", ""]]
 
 
 @pytest.mark.parametrize("api_format", ["openai", "anthropic"])
-def test_message_instruction_roles_at_all_positions_and_only_changed_nodes_are_copied(api_format):
+def test_all_message_roles_and_descriptions_are_rewritten_and_only_changed_nodes_are_copied(api_format):
     request = {
         "messages": [
             {"role": "system", "content": "You are Codex", "name": "Codex"},
@@ -160,14 +163,19 @@ def test_message_instruction_roles_at_all_positions_and_only_changed_nodes_are_c
     }
     before = copy.deepcopy(request)
     result, count = rewrite_request(request, api_format, ENABLED)
-    assert count == (4 if api_format == "anthropic" else 3)
-    assert result["messages"][0]["content"] == "You are Antigravity"
+    assert count == (8 if api_format == "anthropic" else 7)
+    assert result["messages"][0]["content"] == OFFICIAL_ANTIGRAVITY_IDENTITY
     assert result["messages"][3]["content"][0]["text"] == "Use Antigravity"
     assert result["messages"][5]["content"] == "Antigravity"
     assert result["messages"][0]["name"] == "Codex"
     for index in (1, 2, 4):
-        assert result["messages"][index] is request["messages"][index]
-    assert result["tools"] is request["tools"]
+        assert result["messages"][index]["content"] == "Antigravity"
+    assert result["messages"][1]["image"] is request["messages"][1]["image"]
+    assert result["messages"][2]["tool_calls"] is request["messages"][2]["tool_calls"]
+    assert result["messages"][4]["tool_call_id"] == "Codex"
+    assert result["tools"][0]["description"] == "Antigravity"
+    assert result["tools"][0]["name"] == "Codex"
+    assert result["tools"][0]["input"] is request["tools"][0]["input"]
     assert result["metadata"] is request["metadata"]
     original_blocks, changed_blocks = request["messages"][3]["content"], result["messages"][3]["content"]
     assert changed_blocks[0]["cache_control"] is original_blocks[0]["cache_control"]
@@ -193,20 +201,226 @@ def test_gemini_both_system_aliases_rewrite_only_text_parts():
     }
     before = copy.deepcopy(request)
     result, count = rewrite_request(request, "gemini", ENABLED)
-    assert count == 2
+    assert count == 3
     assert result["systemInstruction"]["parts"][0]["text"] == "Antigravity"
     assert result["system_instruction"]["parts"][0]["text"] == "Antigravity"
     for index in (1, 2, 3):
         assert result["systemInstruction"]["parts"][index] is request["systemInstruction"]["parts"][index]
-    assert result["contents"] is request["contents"]
+    assert result["contents"][0]["parts"][0]["text"] == "Antigravity"
     assert result["tools"] is request["tools"]
     assert result["metadata"] is request["metadata"]
     assert request == before
 
 
-@pytest.mark.parametrize("api_format", ["openai", "anthropic", "gemini", "unknown"])
+@pytest.mark.parametrize("api_format", ["openai", "anthropic", "gemini", "responses", "unknown"])
 def test_unchanged_requests_retain_the_original_object(api_format):
-    request = {"messages": [{"role": "user", "content": "Codex"}], "system": "CODEX.md"}
+    request = {"messages": [{"role": "user", "content": "Already anonymous"}], "system": "CODEX.md"}
     result, count = rewrite_request(request, api_format, ENABLED)
     assert result is request
     assert count == 0
+
+
+def test_custom_empty_mapping_replaces_substrings_and_protected_text_before_defaults():
+    settings = PromptRewriteConfig(True, True, (("Codex", ""), ("Cursor", "Codex")))
+    text = "Codex CLI OpenAI Codex my_Codex_agent `Codex` CODEX.md /Codex/file https://test/Codex Cursor"
+    assert rewrite_prompt_text(text, settings) == (
+        " CLI OpenAI  my__agent `` .md //file https://test/ Codex", 8,
+    )
+
+
+@pytest.mark.parametrize("name, source, expected", [
+    ("OpenAI", "OpenAI Codex", " Antigravity"),
+    ("CLI", "Codex CLI", "Antigravity "),
+])
+def test_partial_custom_matches_do_not_hide_default_names_in_remaining_source(name, source, expected):
+    assert rewrite_prompt_text(source, PromptRewriteConfig(True, True, ((name, ""),))) == (expected, 2)
+
+
+def test_empty_mapping_prunes_only_newly_empty_text_messages_and_preserves_tool_responses():
+    image = {"type": "image_url", "image_url": {"url": "data:Codex"}}
+    request = {"messages": [
+        {"role": "system", "content": "Codex"},
+        {"role": "user", "content": "Codex"},
+        {"role": "assistant", "content": [{"type": "text", "text": "Codex"}]},
+        {"role": "user", "content": [{"type": "text", "text": "Codex"}, image]},
+        {"role": "tool", "content": "Codex", "tool_call_id": "Codex"},
+        {"role": "user", "content": "Please remove Codex here."},
+    ]}
+    before = copy.deepcopy(request)
+    result, count = rewrite_request(request, "openai", PromptRewriteConfig(True, False, (("Codex", ""),)))
+    assert count == 6
+    assert len(result["messages"]) == 3
+    assert result["messages"][0]["content"] == [image]
+    assert result["messages"][0]["content"][0] is image
+    assert result["messages"][1] == {"role": "tool", "content": "", "tool_call_id": "Codex"}
+    assert result["messages"][2]["content"] == "Please remove  here."
+    assert request == before
+
+
+@pytest.mark.parametrize("api_format", ["anthropic", "gemini"])
+def test_empty_instruction_parts_are_pruned_without_removing_other_instructions(api_format):
+    parts = [{"text": "Codex"}, {"text": "Keep instructions."}] if api_format == "gemini" else [
+        {"type": "text", "text": "Codex"}, {"type": "text", "text": "Keep instructions."},
+    ]
+    request = {"systemInstruction": {"parts": parts}} if api_format == "gemini" else {"system": parts}
+    before = copy.deepcopy(request)
+    result, count = rewrite_request(request, api_format, PromptRewriteConfig(True, False, (("Codex", ""),)))
+    assert count == 1
+    updated = result["systemInstruction"]["parts"] if api_format == "gemini" else result["system"]
+    assert updated == [parts[1]]
+    assert updated[0] is parts[1]
+    assert request == before
+
+
+@pytest.mark.parametrize("api_format", ["openai", "anthropic"])
+def test_nested_tool_result_text_and_string_blocks_are_rewritten_without_touching_call_data(api_format):
+    call = {"type": "tool_use", "name": "Codex", "id": "Codex", "input": {"name": "Codex"}}
+    image = {"type": "image", "source": {"data": "Codex"}}
+    request = {"messages": [
+        {"role": "assistant", "content": [{"type": "text", "text": "Codex"}, call]},
+        {"role": "user", "content": [
+            "Codex", {"type": "tool_result", "tool_use_id": "Codex", "content": [
+                {"type": "text", "text": "Codex"}, image,
+            ]},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "Codex", "content": "Codex"}]},
+    ]}
+    before = copy.deepcopy(request)
+    result, count = rewrite_request(request, api_format, ENABLED)
+    assert count == 4
+    assert result["messages"][0]["content"][0]["text"] == "Antigravity"
+    assert result["messages"][0]["content"][1] is call
+    assert result["messages"][1]["content"][0] == "Antigravity"
+    nested = result["messages"][1]["content"][1]
+    assert nested["tool_use_id"] == "Codex"
+    assert nested["content"][0]["text"] == "Antigravity"
+    assert nested["content"][1] is image
+    assert result["messages"][2]["content"][0]["content"] == "Antigravity"
+    assert request == before
+
+
+def test_gemini_function_response_values_are_rewritten_but_call_names_keys_and_args_are_preserved():
+    request = {"contents": [
+        {"role": "model", "parts": [{"functionCall": {"name": "Codex", "args": {"client": "Codex"}}}]},
+        {"role": "user", "parts": [
+            {"functionResponse": {"name": "Codex", "id": "Codex", "response": {
+                "Codex": ["Codex", {"value": "Cursor", "number": 1}],
+            }}},
+            {"function_response": {"name": "Cursor", "response": {"result": "Codex"}}},
+        ]},
+    ]}
+    before = copy.deepcopy(request)
+    result, count = rewrite_request(request, "gemini", ENABLED)
+    assert count == 3
+    assert result["contents"][0] is request["contents"][0]
+    first = result["contents"][1]["parts"][0]["functionResponse"]
+    assert first["name"] == first["id"] == "Codex"
+    assert first["response"] == {"Codex": ["Antigravity", {"value": "Antigravity", "number": 1}]}
+    assert result["contents"][1]["parts"][1]["function_response"]["response"] == {"result": "Antigravity"}
+    assert request == before
+
+
+@pytest.mark.parametrize("api_format", ["openai", "anthropic", "gemini"])
+def test_signed_thinking_and_non_text_blocks_remain_unchanged(api_format):
+    signed = [
+        {"type": "thinking", "thinking": "Codex", "signature": "Codex"},
+        {"type": "text", "text": "Codex", "thoughtSignature": "Codex"},
+        {"type": "text", "text": "Codex", "thought_signature": "Codex"},
+        {"text": "Codex", "thought": True},
+        {"type": "image", "text": "Codex", "source": {"data": "Codex"}},
+    ]
+    field, root = ("parts", "contents") if api_format == "gemini" else ("content", "messages")
+    request = {root: [{"role": "assistant", field: signed}]}
+    result, count = rewrite_request(request, api_format, PromptRewriteConfig(True, True, (("Codex", ""),), True))
+    assert count == 0
+    assert result is request
+
+
+@pytest.mark.parametrize("source, expected, count", [
+    ("", "", 0),
+    ("a AI tool four test 123 中文", "a AI tool four test 123 中文", 0),
+    ("Hello ABCDE abcdefghijklmnop", "Hel\u200blo ABC\u200bDE abc\u200bdefghijklmnop", 3),
+    ("English, words! description\n工具描述", "Eng\u200blish, wor\u200bds! des\u200bcription\n工具描述", 3),
+    ("already\u200bcloaked des\u200bcription", "already\u200bcloaked des\u200bcription", 0),
+])
+def test_cloak_uses_real_zero_width_space_and_is_idempotent(source, expected, count):
+    assert cloak_text(source) == (expected, count)
+    assert cloak_text(expected) == (expected, 0)
+
+
+@pytest.mark.parametrize("api_format", ["openai", "anthropic", "gemini", "responses"])
+def test_cloak_is_independent_of_keyword_rules_and_only_applies_to_instructions_and_descriptions(api_format):
+    prose = "English description"
+    cloaked = "Eng\u200blish des\u200bcription"
+    schema = {"type": "object", "properties": {
+        "description": {"type": "string", "description": prose, "enum": [prose], "default": prose},
+    }, "examples": [{"description": prose}]}
+    tool = {"name": "English", "description": prose, "parameters": schema}
+    if api_format == "gemini":
+        request = {"systemInstruction": {"parts": [{"text": prose}]},
+                   "contents": [{"role": "user", "parts": [{"text": prose}]}],
+                   "tools": [{"functionDeclarations": [tool]}]}
+    elif api_format == "anthropic":
+        request = {"system": [{"type": "text", "text": prose}],
+                   "messages": [{"role": "user", "content": prose}], "tools": [tool]}
+    elif api_format == "responses":
+        request = {"instructions": prose, "input": [{"role": "user", "content": prose}], "tools": [tool]}
+    else:
+        request = {"messages": [
+            {"role": "system", "content": [{"type": "text", "text": prose}]},
+            {"role": "user", "content": prose},
+            {"role": "developer", "content": prose},
+        ], "tools": [{"type": "function", "function": tool}]}
+    before = copy.deepcopy(request)
+    settings = PromptRewriteConfig(False, False, (), True)
+    result, count = rewrite_request(request, api_format, settings)
+    assert count == (8 if api_format == "openai" else 6)
+    if api_format == "gemini":
+        assert result["systemInstruction"]["parts"][0]["text"] == cloaked
+        assert result["contents"] is request["contents"]
+        changed_tool = result["tools"][0]["functionDeclarations"][0]
+    elif api_format == "anthropic":
+        assert result["system"][0]["text"] == cloaked
+        assert result["messages"] is request["messages"]
+        changed_tool = result["tools"][0]
+    elif api_format == "responses":
+        assert result["instructions"] == cloaked
+        assert result["input"] is request["input"]
+        changed_tool = result["tools"][0]
+    else:
+        assert result["messages"][0]["content"][0]["text"] == cloaked
+        assert result["messages"][1] is request["messages"][1]
+        assert result["messages"][2]["content"] == cloaked
+        changed_tool = result["tools"][0]["function"]
+    assert changed_tool["name"] == "English"
+    assert changed_tool["description"] == cloaked
+    prop = changed_tool["parameters"]["properties"]["description"]
+    assert prop["description"] == cloaked
+    assert prop["enum"] is schema["properties"]["description"]["enum"]
+    assert prop["default"] == prose
+    assert changed_tool["parameters"]["examples"] is schema["examples"]
+    assert request == before
+    repeated, repeated_count = rewrite_request(result, api_format, settings)
+    assert repeated is result
+    assert repeated_count == 0
+
+
+def test_responses_input_text_output_text_and_function_outputs_are_supported():
+    request = {"instructions": "You are Codex.", "input": [
+        {"role": "developer", "content": [{"type": "input_text", "text": "Use Codex"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "Codex"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "Codex"}]},
+        {"type": "function_call", "name": "Codex", "arguments": '{"name": "Codex"}'},
+        {"type": "function_call_output", "call_id": "Codex", "output": "Codex result"},
+    ]}
+    before = copy.deepcopy(request)
+    result, count = rewrite_request(request, "responses", ENABLED)
+    assert count == 5
+    assert result["instructions"] == OFFICIAL_ANTIGRAVITY_IDENTITY
+    assert result["input"][0]["content"][0]["text"] == "Use Antigravity"
+    assert result["input"][1]["content"][0]["text"] == "Antigravity"
+    assert result["input"][2]["content"][0]["text"] == "Antigravity"
+    assert result["input"][3] is request["input"][3]
+    assert result["input"][4] == {"type": "function_call_output", "call_id": "Codex", "output": "Antigravity result"}
+    assert request == before
+    assert rewrite_request({"input": "Codex"}, "responses", ENABLED) == ({"input": "Antigravity"}, 1)

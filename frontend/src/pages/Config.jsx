@@ -145,18 +145,22 @@ const CONFIG_GROUPS = [
     fields: [
       {
         key: "prompt_rewrite_enabled", label: "启用提示词身份改写", type: "bool",
-        note: "仅改写系统 / 开发者指令中的客户端身份名称，默认替换为 Antigravity。代码、文件名、路径、URL 和 MCP 标识会保留。旧词条已迁移为名称映射，旧开关状态继续沿用。",
+        note: "关键词替换覆盖系统、开发者、用户、助手和工具结果的全部正文，以及工具描述。开启默认词表时，还会清理系统指令中的计费头、归一化明确身份声明并折叠文首重复身份。旧词条已迁移为名称映射，旧开关状态继续沿用。",
       },
       {
         key: "prompt_rewrite_use_default_keywords", label: "使用内置默认词表", type: "bool",
-        note: "包含 Codex、Claude Code、Claude Agent SDK、Cursor 等客户端名称。自定义规则覆盖同名默认规则；空自定义列表仍可使用内置词表。",
+        note: "包含 Codex、Claude Code、Claude Agent SDK、Cursor、DeepSeek Harness 等客户端名称，默认替换为 Antigravity。内置规则保护代码、路径、URL 和标识；自定义规则优先，空自定义列表仍可使用内置词表。",
       },
       {
         key: "prompt_rewrite_rules", label: "自定义名称映射", type: "rules",
         columnLabels: ["客户端名称", "替换文本"],
-        columnPlaceholders: ["例如 Codex", "例如 Antigravity"],
+        columnPlaceholders: ["例如 Codex", "留空表示删除"],
         emptyHint: "暂无自定义规则；默认词表开启时仍会生效。",
-        note: "按名称字面量匹配，不区分大小写；较长名称优先，同名自定义规则以最后一条为准。名称与替换文本均不能为空，保存后立即生效。",
+        note: "按字面量查找替换全部消息正文，不区分大小写，含代码、路径和名称子串。较长名称优先，同名规则以最后一条为准。名称不能为空，替换文本留空即删除命中内容；保存后立即生效。",
+      },
+      {
+        key: "prompt_rewrite_cloak_enabled", label: "暴力零宽打散", type: "bool",
+        note: "独立开关，无需关键词词表。在系统 / 开发者指令和工具描述中，将长度至少 5 个字母的英文词在第 3 个字母后插入零宽空格（U+200B），已打散的词不会重复处理。此模式也会打散这些文本中的代码、路径和 URL。",
       },
     ],
   },

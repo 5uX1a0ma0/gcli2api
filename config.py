@@ -53,6 +53,7 @@ ENV_MAPPINGS = {
     "PROMPT_REWRITE_ENABLED": "prompt_rewrite_enabled",
     "PROMPT_REWRITE_USE_DEFAULT_KEYWORDS": "prompt_rewrite_use_default_keywords",
     "PROMPT_REWRITE_RULES": "prompt_rewrite_rules",
+    "PROMPT_REWRITE_CLOAK_ENABLED": "prompt_rewrite_cloak_enabled",
     "IP_WHITELIST": "ip_whitelist",
     "IP_WHITELIST_ENABLED": "ip_whitelist_enabled",
     "MODEL_REWRITE_ENABLED": "model_rewrite_enabled",
@@ -320,6 +321,7 @@ async def get_return_thoughts_to_frontend() -> bool:
 
 PROMPT_REWRITE_KEYS = frozenset({
     "prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords", "prompt_rewrite_rules",
+    "prompt_rewrite_cloak_enabled",
 })
 LEGACY_PROMPT_REWRITE_KEYS = frozenset({"sensitive_words_enabled", "sensitive_words"})
 
@@ -361,6 +363,9 @@ def _prompt_rewrite_env_values(*, warn: bool = True) -> dict[str, Any]:
         )),
         ("prompt_rewrite_use_default_keywords", (
             ("PROMPT_REWRITE_USE_DEFAULT_KEYWORDS", _parse_prompt_rewrite_bool),
+        )),
+        ("prompt_rewrite_cloak_enabled", (
+            ("PROMPT_REWRITE_CLOAK_ENABLED", _parse_prompt_rewrite_bool),
         )),
         ("prompt_rewrite_rules", (
             ("PROMPT_REWRITE_RULES", _parse_prompt_rewrite_rules_env),
@@ -430,7 +435,12 @@ async def get_prompt_rewrite_config() -> PromptRewriteConfig:
             storage, "prompt_rewrite_rules", validate_prompt_rewrite_rules, [],
             "sensitive_words", migrate_sensitive_words,
         )
-    return PromptRewriteConfig(enabled, use_defaults, tuple(tuple(rule) for rule in rules))
+    cloak_enabled = overrides.get("prompt_rewrite_cloak_enabled")
+    if cloak_enabled is None:
+        cloak_enabled = _prompt_rewrite_storage_value(
+            storage, "prompt_rewrite_cloak_enabled", _parse_prompt_rewrite_bool, False,
+        )
+    return PromptRewriteConfig(enabled, use_defaults, tuple(tuple(rule) for rule in rules), cloak_enabled)
 
 
 async def get_prompt_rewrite_enabled() -> bool:
@@ -443,6 +453,10 @@ async def get_prompt_rewrite_use_default_keywords() -> bool:
 
 async def get_prompt_rewrite_rules() -> list[list[str]]:
     return [list(rule) for rule in (await get_prompt_rewrite_config()).rules]
+
+
+async def get_prompt_rewrite_cloak_enabled() -> bool:
+    return (await get_prompt_rewrite_config()).cloak_enabled
 
 
 async def get_sensitive_words_enabled() -> bool:

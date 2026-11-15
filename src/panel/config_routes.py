@@ -100,6 +100,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
             "prompt_rewrite_enabled": rewrite.enabled,
             "prompt_rewrite_use_default_keywords": rewrite.use_default_keywords,
             "prompt_rewrite_rules": [list(rule) for rule in rewrite.rules],
+            "prompt_rewrite_cloak_enabled": rewrite.cloak_enabled,
             "sensitive_words_enabled": rewrite.enabled,
             "sensitive_words": [name for name, _ in rewrite.rules],
         })
@@ -179,8 +180,8 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             if not isinstance(new_config["return_thoughts_to_frontend"], bool):
                 raise HTTPException(status_code=400, detail="思维链返回开关必须是布尔值")
 
-        # 验证整份身份改写配置；禁止空名称、空替换文本和部分接受规则。
-        for key in ("prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords"):
+        # 验证整份改写配置；名称不能为空，替换文本允许留空表示删除。
+        for key in ("prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords", "prompt_rewrite_cloak_enabled"):
             if key in new_config and not isinstance(new_config[key], bool):
                 raise HTTPException(status_code=400, detail="身份改写开关必须是布尔值")
         if "prompt_rewrite_rules" in new_config:
@@ -290,6 +291,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
             ("prompt_rewrite_enabled", rewrite.enabled),
             ("prompt_rewrite_use_default_keywords", rewrite.use_default_keywords),
             ("prompt_rewrite_rules", [list(rule) for rule in rewrite.rules]),
+            ("prompt_rewrite_cloak_enabled", rewrite.cloak_enabled),
         ):
             if key not in storage_config and key not in env_locked_keys:
                 new_config.setdefault(key, value)

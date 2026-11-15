@@ -1,4 +1,4 @@
-// 与后端一致：规则是非空字符串二元组；名称按字面量匹配，不解释正则。
+// 与后端一致：名称非空，替换文本留空表示删除；名称按字面量匹配。
 // Python str.strip 的空白集合（JS trim 会额外删除 BOM，但不删除 NEL 等字符）。
 const RULE_WHITESPACE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
 
@@ -13,8 +13,8 @@ export function validatePromptRewriteRules(value) {
       return;
     }
     const cleaned = rule.map((item) => item.replace(RULE_WHITESPACE, ""));
-    if (cleaned.some((item) => !item)) {
-      rowErrors[index] = `第 ${index + 1} 条规则的客户端名称和替换文本均不能为空`;
+    if (!cleaned[0]) {
+      rowErrors[index] = `第 ${index + 1} 条规则的客户端名称不能为空；替换文本留空表示删除`;
       return;
     }
     rules.push(cleaned);

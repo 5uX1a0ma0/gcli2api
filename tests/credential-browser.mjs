@@ -22,6 +22,7 @@ const settings = {
   auto_ban_error_codes: [403], retry_error_codes: [400, 403, 429, 500, 503],
   request_log_error_codes: [400], request_log_enabled: true,
   prompt_rewrite_enabled: false, prompt_rewrite_use_default_keywords: true,
+  prompt_rewrite_cloak_enabled: false,
   prompt_rewrite_rules: [["Legacy Client", "Antigravity"]],
   sensitive_words_enabled: false, sensitive_words: ["Legacy Client"],
   model_rewrite_enabled: true, model_rewrite_rules: [["^gpt-4$", "gemini-2.5-flash"]],
@@ -333,8 +334,10 @@ try {
   assert(await hasText("提示词身份改写")); assert(await hasText("旧词条已迁移"));
   assert.equal(await evaluate("document.getElementById('prompt_rewrite_enabled').getAttribute('aria-checked')"), "false");
   assert.equal(await evaluate("document.getElementById('prompt_rewrite_use_default_keywords').getAttribute('aria-checked')"), "true");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_cloak_enabled').getAttribute('aria-checked')"), "false");
   assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-name').value"), "Legacy Client");
   assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-name').placeholder"), "例如 Codex");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-replacement').placeholder"), "留空表示删除");
   assert.equal(await evaluate("document.getElementById('model_rewrite_rules-0-name').placeholder"), "匹配正则，如 ^gpt-4$");
   assert.equal(await evaluate("document.getElementById('prompt-rewrite-settings').textContent.includes('正则')"), false);
   assert.equal(await evaluate("getComputedStyle(document.getElementById('prompt_rewrite_enabled-note')).color"), "rgb(156, 163, 175)");
@@ -342,13 +345,23 @@ try {
   await evaluate("document.getElementById('prompt_rewrite_enabled').click()");
   await waitFor(() => evaluate("document.getElementById('prompt_rewrite_enabled').getAttribute('aria-checked')==='true'"), "identity rewrite enabled");
   await inputValue("prompt_rewrite_rules-0-name", " Codex ");
-  await inputValue("prompt_rewrite_rules-0-replacement", " ");
-  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-replacement').getAttribute('aria-invalid')"), "true");
-  assert(await hasText("客户端名称和替换文本均不能为空"));
+  await inputValue("prompt_rewrite_rules-0-replacement", "");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-replacement').getAttribute('aria-invalid')"), "false");
+  assert.equal(await evaluate(`${button("保存配置")}.disabled`), false);
+  await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "empty replacement saved");
+  assert.deepEqual(saves.at(-1).prompt_rewrite_rules, [["Codex", ""]]);
+  await click("关闭");
+  await waitFor(() => evaluate("document.getElementById('prompt_rewrite_rules-0-name')?.value==='Codex'"), "saved deletion mapping");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-replacement').value"), "");
+  await capture("desktop-prompt-deletion", false, "#prompt-rewrite-settings");
+  await inputValue("prompt_rewrite_rules-0-name", "");
+  assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-0-name').getAttribute('aria-invalid')"), "true");
+  assert(await hasText("客户端名称不能为空；替换文本留空表示删除"));
   assert.equal(await evaluate(`${button("保存配置")}.disabled`), true);
   const beforeInvalidRules = saves.length;
   await capture("desktop-prompt-error", false, "#prompt-rewrite-settings");
   assert.equal(saves.length, beforeInvalidRules);
+  await inputValue("prompt_rewrite_rules-0-name", " Codex ");
   await inputValue("prompt_rewrite_rules-0-replacement", " Bridge ");
   const addPromptRule = async () => {
     await evaluate("[...document.getElementById('prompt_rewrite_rules').querySelectorAll('button')].find(b=>b.textContent.trim()==='新增规则').click()");
@@ -360,8 +373,10 @@ try {
   await inputValue("prompt_rewrite_rules-1-replacement", "Antigravity");
   assert.equal(await evaluate("document.getElementById('prompt_rewrite_rules-1-name').getAttribute('aria-label')"), "客户端名称，第 2 条");
   assert.equal(await evaluate(`${button("保存配置")}.disabled`), false);
+  await evaluate("document.getElementById('prompt_rewrite_cloak_enabled').click()");
   await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "identity mappings saved");
   assert.equal(saves.at(-1).prompt_rewrite_enabled, true);
+  assert.equal(saves.at(-1).prompt_rewrite_cloak_enabled, true);
   assert.deepEqual(saves.at(-1).prompt_rewrite_rules, [["Codex", "Bridge"], ["cOdEx", "Antigravity"]]);
   assert.equal(Object.hasOwn(saves.at(-1), "sensitive_words"), false);
   assert.equal(Object.hasOwn(saves.at(-1), "sensitive_words_enabled"), false);
@@ -377,17 +392,20 @@ try {
   await waitFor(() => hasText("暂无自定义规则；默认词表开启时仍会生效。"), "default keywords with empty custom rules");
   assert.equal(await evaluate(`${button("保存配置")}.disabled`), false);
   await evaluate("document.getElementById('prompt_rewrite_use_default_keywords').click()");
+  await evaluate("document.getElementById('prompt_rewrite_enabled').click()");
   await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "empty identity policy saved");
   assert.deepEqual(saves.at(-1).prompt_rewrite_rules, []);
   assert.equal(saves.at(-1).prompt_rewrite_use_default_keywords, false);
+  assert.equal(saves.at(-1).prompt_rewrite_enabled, false);
+  assert.equal(saves.at(-1).prompt_rewrite_cloak_enabled, true);
   await click("关闭");
   await evaluate("document.getElementById('prompt_rewrite_use_default_keywords').click()");
   await click("保存配置"); await waitFor(() => hasText("配置保存成功"), "built-in identity keywords saved");
   await click("关闭"); await capture("mobile-prompt-empty", false, "#prompt-rewrite-settings");
-  envLocked = ["prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords", "prompt_rewrite_rules", "sensitive_words_enabled", "sensitive_words"];
+  envLocked = ["prompt_rewrite_enabled", "prompt_rewrite_use_default_keywords", "prompt_rewrite_rules", "prompt_rewrite_cloak_enabled", "sensitive_words_enabled", "sensitive_words"];
   await click("刷新配置");
   await waitFor(() => evaluate("document.getElementById('prompt-rewrite-settings')?.querySelectorAll('button').length===0"), "locked identity settings");
-  assert.equal(await evaluate("document.getElementById('prompt-rewrite-settings').textContent.split('该配置已被环境变量锁定').length-1"), 3);
+  assert.equal(await evaluate("document.getElementById('prompt-rewrite-settings').textContent.split('该配置已被环境变量锁定').length-1"), 4);
   await capture("mobile-prompt-locked", false, "#prompt-rewrite-settings");
   envLocked = []; await click("刷新配置");
   await waitFor(() => evaluate("!!document.getElementById('prompt_rewrite_enabled')"), "unlocked identity settings");
@@ -448,8 +466,8 @@ try {
     configSaves: saves.length, modelRefreshes: modelChecks.length, modelPeak, paidRefreshes: paidRefreshes.length, deduplicationRequests: dedupRequests.length, captures,
     states: ["model list", "model empty", "model failure", "model refresh", "model long names", "Paid refresh", "model batch stop", "model batch partial failure", "selected", "running", "partial failure", "stopped", "unmount", "saved setting", "keyboard", "mobile", "landscape", "reduced motion", "empty",
       "invalid code drafts", "normalized code save", "empty codes", "environment lock",
-      "identity migration", "identity mapping edit", "identity invalid replacement", "identity duplicate names",
-      "identity save", "identity saved scroll position", "identity empty rules", "identity defaults off", "identity defaults on", "identity environment lock",
+      "identity migration", "identity mapping edit", "identity empty replacement", "identity invalid name", "identity duplicate names",
+      "identity save", "identity saved scroll position", "identity empty rules", "identity defaults off", "identity defaults on", "identity cloak independent", "identity environment lock",
       "selected deduplication", "changed selection", "all deduplication", "dedup preview", "conflict", "scan cancellation", "scan error", "no duplicates", "cleanup"] };
   await writeFile(path.join(output, "report.json"), JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2));
 } finally {
